@@ -1,0 +1,64 @@
+# =============================================================
+# azure-pipelines.yml
+# Pipeline di release per deploy soluzione Fabric
+# =============================================================
+trigger: none   # Solo manuale o da release trigger
+
+parameters:
+  - name: targetEnvironment
+    displayName: "Workspace target"
+    type: string
+    default: dev
+    values:
+      - dev
+      - prod
+
+variables:
+  - group: fabric-deploy-${{ parameters.targetEnvironment }}  # Variable group da Library
+
+stages:
+  - stage: DeployFabric
+    displayName: "Deploy Fabric — ${{ parameters.targetEnvironment }}"
+    jobs:
+      - job: Deploy
+        displayName: "Deploy items"
+        pool:
+          vmImage: "windows-latest"
+
+        steps:
+          - checkout: self
+
+          # ── Verifica variabili obbligatorie ──────────────────
+          - task: PowerShell@2
+            displayName: "Verifica variabili"
+            inputs:
+              targetType: inline
+              script: |
+                $required = @("FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID","FABRIC_LAKEHOUSE_ID")
+                foreach ($v in $required) {
+                  $val = [System.Environment]::GetEnvironmentVariable($v)
+                  if ([string]::IsNullOrEmpty($val)) {
+                    Write-Error "❌ Variabile mancante: $v"
+                    exit 1
+                  }
+                  Write-Host "✅ $v = OK"
+                }
+            env:
+              FABRIC_TENANT_ID:     $(FABRIC_TENANT_ID)
+              FABRIC_CLIENT_ID:     $(FABRIC_CLIENT_ID)
+              FABRIC_CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
+              FABRIC_WORKSPACE_ID:  $(FABRIC_WORKSPACE_ID)
+              FABRIC_LAKEHOUSE_ID:  $(FABRIC_LAKEHOUSE_ID)
+
+          # ── Deploy tutti gli item Fabric ──────────────────────
+          - task: PowerShell@2
+            displayName: "Deploy Fabric items"
+            inputs:
+              filePath: "scripts/deploy.ps1"
+              arguments: >
+                -TenantId      "$(FABRIC_TENANT_ID)"
+                -ClientId      "$(FABRIC_CLIENT_ID)"
+                -ClientSecret  "$(FABRIC_CLIENT_SECRET)"
+                -WorkspaceId   "$(FABRIC_WORKSPACE_ID)"
+                -LakehouseId   "$(FABRIC_LAKEHOUSE_ID)"
+                -PythonFileName "$(PYTHON_FILE_NAME)"
