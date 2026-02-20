@@ -1,6 +1,7 @@
 # =============================================================
-# deploy.ps1 — Deploy completo soluzione Fabric
-# Ordine: 1) Upload Python → 2) Mirroring DB → 3) Spark Job → 4) Pipeline
+# deploy.ps1 - Deploy completo soluzione Fabric
+# Compatibile con PowerShell 5.1 (Windows runner DevOps)
+# Ordine: 1) Upload Python -> 2) Mirroring DB -> 3) Spark Job -> 4) Pipeline
 # =============================================================
 param(
     [Parameter(Mandatory=$true)][string]$TenantId,
@@ -8,10 +9,10 @@ param(
     [Parameter(Mandatory=$true)][string]$ClientSecret,
     [Parameter(Mandatory=$true)][string]$WorkspaceId,
     [Parameter(Mandatory=$true)][string]$LakehouseId,
-    [string]$PythonFileName    = "bc_sync.py",
-    [string]$MirroringDbName   = "MirrorDB_BC_Landing",
-    [string]$SparkJobName      = "SJD_BC_To_Mirroring",
-    [string]$PipelineName      = "DP_BC_To_Mirroring"
+    [string]$PythonFileName  = "bc_sync.py",
+    [string]$MirroringDbName = "MirrorDB_BC_Landing",
+    [string]$SparkJobName    = "SJD_BC_To_Mirroring",
+    [string]$PipelineName    = "DP_BC_To_Mirroring"
 )
 
 Set-StrictMode -Version Latest
@@ -34,12 +35,21 @@ function Invoke-FabricApi {
     $params = @{ Method = $Method; Uri = $Url; Headers = $Headers }
     if ($Body) { $params["Body"] = $Body }
 
-    # Gestione Long Running Operation (202 Accepted)
     $response = Invoke-WebRequest @params -UseBasicParsing
+
+    # Gestione Long Running Operation (202 Accepted)
     if ($response.StatusCode -eq 202) {
         $locationUrl = $response.Headers["Location"]
-        $retryAfter  = [int]($response.Headers["Retry-After"] ?? 5)
-        Write-Host "    ⏳ Operazione asincrona, polling ogni ${retryAfter}s..."
+
+        # PS 5.1 non supporta ??, usiamo if/else
+        $retryAfterRaw = $response.Headers["Retry-After"]
+        if ($retryAfterRaw) {
+            $retryAfter = [int]$retryAfterRaw
+        } else {
+            $retryAfter = 5
+        }
+
+        Write-Host "    [ASYNC] Polling ogni ${retryAfter}s..."
         do {
             Start-Sleep -Seconds $retryAfter
             $pollResp = Invoke-WebRequest -Uri $locationUrl -Headers $Headers -Method GET -UseBasicParsing
@@ -58,23 +68,23 @@ function Get-OrCreate-Item {
         [string]$BodyJson,
         [hashtable]$Headers
     )
-    # Cerca se esiste già
     $existing = (Invoke-RestMethod -Uri $ListUrl -Headers $Headers -Method GET).value `
                 | Where-Object { $_.displayName -eq $DisplayName -and $_.type -eq $Type }
     if ($existing) {
-        Write-Host "  ℹ️  '$DisplayName' ($Type) già esistente — ID: $($existing.id)"
+        Write-Host "  [OK] '$DisplayName' ($Type) gia esistente - ID: $($existing.id)"
         return $existing.id
     }
-    Write-Host "  ➕ Creo '$DisplayName' ($Type)..."
+    Write-Host "  [NEW] Creo '$DisplayName' ($Type)..."
     $result = Invoke-FabricApi -Method POST -Url $CreateUrl -Headers $Headers -Body $BodyJson
-    Write-Host "  ✅ Creato — ID: $($result.id)"
+    Write-Host "  [OK] Creato - ID: $($result.id)"
     return $result.id
 }
 
 # ─────────────────────────────────────────
 # 0. AUTENTICAZIONE
 # ─────────────────────────────────────────
-Write-Host "`n🔐 Autenticazione Service Principal..."
+Write-Host ""
+Write-Host "[AUTH] Autenticazione Service Principal..."
 $tokenUrl  = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
 $tokenBody = @{
     grant_type    = "client_credentials"
@@ -87,59 +97,55 @@ $headers = @{
     Authorization  = "Bearer $token"
     "Content-Type" = "application/json"
 }
-$baseUrl     = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
-$onelakeUrl  = "https://onelake.dfs.fabric.microsoft.com"
-Write-Host "✅ Token ottenuto`n"
+$baseUrl    = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
+$onelakeUrl = "https://onelake.dfs.fabric.microsoft.com"
+Write-Host "[OK] Token Fabric ottenuto"
 
 # ─────────────────────────────────────────
 # 1. UPLOAD FILE PYTHON SU LAKEHOUSE
 # ─────────────────────────────────────────
+Write-Host ""
 Write-Host "=== STEP 1: Upload Python sul Lakehouse ==="
 
-# Token OneLake (stessa app, scope diverso)
 $onelakeTokenBody = @{
     grant_type    = "client_credentials"
     client_id     = $ClientId
     client_secret = $ClientSecret
     scope         = "https://storage.azure.com/.default"
 }
-$onelakeToken = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $onelakeTokenBody).access_token
+$onelakeToken   = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $onelakeTokenBody).access_token
 $onelakeHeaders = @{
-    Authorization = "Bearer $onelakeToken"
+    Authorization  = "Bearer $onelakeToken"
     "x-ms-version" = "2023-01-03"
 }
 
-$pythonLocalPath  = Join-Path $PSScriptRoot "..\python\$PythonFileName"
-$pythonRemotePath = "$WorkspaceId/$LakehouseId/Files/Scripts/$PythonFileName"
-$pythonUploadUrl  = "$onelakeUrl/$pythonRemotePath"
+$pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
+$pythonUploadUrl = "$onelakeUrl/$WorkspaceId/$LakehouseId/Files/Scripts/$PythonFileName"
 
-Write-Host "  📤 Upload: $PythonFileName → Files/Scripts/"
+Write-Host "  Upload: $PythonFileName -> Files/Scripts/"
 
-# Crea il file (PUT con header create)
-$createHeaders = $onelakeHeaders.Clone()
-$createHeaders["x-ms-blob-type"] = "BlockBlob"
-
-$pythonBytes   = [System.IO.File]::ReadAllBytes($pythonLocalPath)
+$pythonBytes = [System.IO.File]::ReadAllBytes($pythonLocalPath)
 
 # Step 1a: crea file vuoto
-Invoke-RestMethod -Uri "$pythonUploadUrl`?resource=file" `
+Invoke-RestMethod -Uri "${pythonUploadUrl}?resource=file" `
     -Method PUT -Headers $onelakeHeaders | Out-Null
 
 # Step 1b: append contenuto
-$appendUrl = "$pythonUploadUrl`?action=append&position=0"
 $appendHeaders = $onelakeHeaders.Clone()
 $appendHeaders["Content-Length"] = $pythonBytes.Length.ToString()
-Invoke-RestMethod -Uri $appendUrl -Method PATCH -Headers $appendHeaders -Body $pythonBytes | Out-Null
+Invoke-RestMethod -Uri "${pythonUploadUrl}?action=append&position=0" `
+    -Method PATCH -Headers $appendHeaders -Body $pythonBytes | Out-Null
 
 # Step 1c: flush (commit)
-$flushUrl = "$pythonUploadUrl`?action=flush&position=$($pythonBytes.Length)"
-Invoke-RestMethod -Uri $flushUrl -Method PATCH -Headers $onelakeHeaders | Out-Null
+Invoke-RestMethod -Uri "${pythonUploadUrl}?action=flush&position=$($pythonBytes.Length)" `
+    -Method PATCH -Headers $onelakeHeaders | Out-Null
 
-Write-Host "  ✅ Python caricato su OneLake: Files/Scripts/$PythonFileName`n"
+Write-Host "  [OK] Python caricato: Files/Scripts/$PythonFileName"
 
 # ─────────────────────────────────────────
 # 2. CREA MIRRORING DATABASE
 # ─────────────────────────────────────────
+Write-Host ""
 Write-Host "=== STEP 2: Mirroring Database (Open Mirroring) ==="
 
 $mirroringPayload = @{
@@ -160,7 +166,7 @@ $mirroringPayload = @{
 
 $mirroringBody = @{
     displayName = $MirroringDbName
-    description = "Open Mirroring Landing Zone — Business Central"
+    description = "Open Mirroring Landing Zone - Business Central"
     definition  = @{
         parts = @(@{
             path        = "mirroring.json"
@@ -176,18 +182,18 @@ $existingMirror = (Invoke-RestMethod -Uri $mirrorListUrl -Headers $headers -Meth
 
 if ($existingMirror) {
     $mirroringId = $existingMirror.id
-    Write-Host "  ℹ️  Mirroring DB già esistente — ID: $mirroringId"
+    Write-Host "  [OK] Mirroring DB gia esistente - ID: $mirroringId"
 } else {
-    Write-Host "  ➕ Creo Mirroring Database '$MirroringDbName'..."
+    Write-Host "  [NEW] Creo Mirroring Database '$MirroringDbName'..."
     $mirrorResult = Invoke-FabricApi -Method POST -Url $mirrorListUrl -Headers $headers -Body $mirroringBody
     $mirroringId  = $mirrorResult.id
-    Write-Host "  ✅ Creato — ID: $mirroringId"
+    Write-Host "  [OK] Creato - ID: $mirroringId"
 }
-Write-Host ""
 
 # ─────────────────────────────────────────
 # 3. CREA SPARK JOB DEFINITION
 # ─────────────────────────────────────────
+Write-Host ""
 Write-Host "=== STEP 3: Spark Job Definition ==="
 
 $sparkDefPayload = @{
@@ -221,11 +227,11 @@ $sparkJobId = Get-OrCreate-Item `
     -ListUrl     "$baseUrl/items" `
     -BodyJson    $sparkBody `
     -Headers     $headers
-Write-Host ""
 
 # ─────────────────────────────────────────
 # 4. CREA DATA PIPELINE
 # ─────────────────────────────────────────
+Write-Host ""
 Write-Host "=== STEP 4: Data Pipeline ==="
 
 $pipelinePayload = @{
@@ -271,21 +277,21 @@ $pipelineId = Get-OrCreate-Item `
     -ListUrl     "$baseUrl/items" `
     -BodyJson    $pipelineBody `
     -Headers     $headers
-Write-Host ""
 
 # ─────────────────────────────────────────
 # RIEPILOGO
 # ─────────────────────────────────────────
+Write-Host ""
 Write-Host "============================================"
-Write-Host "✅  DEPLOY COMPLETATO"
+Write-Host "[OK] DEPLOY COMPLETATO"
 Write-Host "============================================"
 Write-Host "  Mirroring Database : $mirroringId"
 Write-Host "  Spark Job          : $sparkJobId"
 Write-Host "  Data Pipeline      : $pipelineId"
 Write-Host "  Python             : Files/Scripts/$PythonFileName"
-Write-Host "============================================`n"
+Write-Host "============================================"
 
-# Esporta output come variabili DevOps (usabili in step successivi)
+# Esporta ID come variabili DevOps per step successivi
 Write-Host "##vso[task.setvariable variable=MIRRORING_ID]$mirroringId"
 Write-Host "##vso[task.setvariable variable=SPARK_JOB_ID]$sparkJobId"
 Write-Host "##vso[task.setvariable variable=PIPELINE_ID]$pipelineId"
