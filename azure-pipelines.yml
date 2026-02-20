@@ -34,24 +34,24 @@ stages:
             inputs:
               targetType: inline
               script: |
-                $required = @{
-                  "FABRIC_TENANT_ID"     = "$(FABRIC_TENANT_ID)"
-                  "FABRIC_CLIENT_ID"     = "$(FABRIC_CLIENT_ID)"
-                  "FABRIC_CLIENT_SECRET" = "$(FABRIC_CLIENT_SECRET)"
-                  "FABRIC_WORKSPACE_ID"  = "$(FABRIC_WORKSPACE_ID)"
-                  "FABRIC_LAKEHOUSE_ID"  = "$(FABRIC_LAKEHOUSE_ID)"
-                }
+                $required = @("FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID","FABRIC_LAKEHOUSE_ID")
                 $ok = $true
-                foreach ($entry in $required.GetEnumerator()) {
-                  $placeholder = "`$($($entry.Key))"
-                  if ([string]::IsNullOrEmpty($entry.Value) -or $entry.Value -eq $placeholder) {
-                    Write-Host "##vso[task.logissue type=error]❌ Variabile mancante: $($entry.Key)"
+                foreach ($v in $required) {
+                  $val = [System.Environment]::GetEnvironmentVariable($v)
+                  if ([string]::IsNullOrEmpty($val)) {
+                    Write-Host "##vso[task.logissue type=error]❌ Variabile mancante: $v"
                     $ok = $false
                   } else {
-                    Write-Host "✅ $($entry.Key) = OK"
+                    Write-Host "✅ $v = OK"
                   }
                 }
                 if (-not $ok) { exit 1 }
+            env:
+              FABRIC_TENANT_ID:     $(FABRIC_TENANT_ID)
+              FABRIC_CLIENT_ID:     $(FABRIC_CLIENT_ID)
+              FABRIC_CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
+              FABRIC_WORKSPACE_ID:  $(FABRIC_WORKSPACE_ID)
+              FABRIC_LAKEHOUSE_ID:  $(FABRIC_LAKEHOUSE_ID)
 
           # ── Deploy tutti gli item Fabric ──────────────────────
           - task: PowerShell@2
