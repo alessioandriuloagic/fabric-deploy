@@ -247,13 +247,13 @@ if ($existingSJD) {
 Write-Host ""
 Write-Host "=== STEP 4: Data Pipeline ==="
 
+# pipeline-content.json: solo properties + activities
 $pipelinePayload = @{
-    name       = $PipelineName
     properties = @{
         activities = @(
             @{
-                name      = "Run BC Sync"
-                type      = "SparkJob"
+                name      = "Run_BC_Sync"
+                type      = "TridentNotebook"
                 dependsOn = @()
                 policy    = @{
                     timeout                = "0.12:00:00"
@@ -263,33 +263,40 @@ $pipelinePayload = @{
                     secureInput            = $false
                 }
                 typeProperties = @{
-                    sparkJobDefinitionId = $sparkJobId
-                    workspaceId          = $WorkspaceId
+                    notebookId  = $sparkJobId
+                    workspaceId = $WorkspaceId
                 }
             }
         )
     }
 } | ConvertTo-Json -Depth 10
 
-$pipelineBody = @{
-    displayName = $PipelineName
-    type        = "DataPipeline"
-    definition  = @{
-        parts = @(@{
-            path        = "pipeline-content.json"
-            payload     = (To-Base64 $pipelinePayload)
-            payloadType = "InlineBase64"
-        })
-    }
-} | ConvertTo-Json -Depth 10
+$pipelineListUrl  = "$baseUrl/dataPipelines"
+$existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
+                    | Where-Object { $_.displayName -eq $PipelineName }
 
-$pipelineId = Get-OrCreate-Item `
-    -DisplayName $PipelineName `
-    -Type        "DataPipeline" `
-    -CreateUrl   "$baseUrl/items" `
-    -ListUrl     "$baseUrl/items" `
-    -BodyJson    $pipelineBody `
-    -Headers     $headers
+if ($existingPipeline) {
+    $pipelineId = $existingPipeline.id
+    Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
+} else {
+    Write-Host "  [NEW] Creo Data Pipeline '$PipelineName'..."
+
+    $pipelineBody = @{
+        displayName = $PipelineName
+        description = "Pipeline orchestratore BC Sync"
+        definition  = @{
+            parts = @(@{
+                path        = "pipeline-content.json"
+                payload     = (To-Base64 $pipelinePayload)
+                payloadType = "InlineBase64"
+            })
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBody
+    $pipelineId     = $pipelineResult.id
+    Write-Host "  [OK] Creata - ID: $pipelineId"
+}
 
 # ─────────────────────────────────────────
 # RIEPILOGO
