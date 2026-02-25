@@ -37,12 +37,16 @@ function Invoke-FabricApi {
     try {
         $response = Invoke-WebRequest @params -UseBasicParsing
     } catch {
-        $errDetails = $_.ErrorDetails
-        $errMsg     = $_.Exception.ToString()
-        if ($errDetails -ne $null) {
-            Write-Host "##[error] API Error: $errDetails"
+        # PS 5.1: leggi il body della risposta HTTP dallo stream
+        $ex = $_.Exception
+        if ($ex.Response -ne $null) {
+            $stream = $ex.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $reader.BaseStream.Position = 0
+            $responseBody = $reader.ReadToEnd()
+            Write-Host "##[error] API Response Body: $responseBody"
         } else {
-            Write-Host "##[error] API Error: $errMsg"
+            Write-Host "##[error] API Error: $($ex.Message)"
         }
         throw
     }
