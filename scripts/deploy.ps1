@@ -194,7 +194,7 @@ $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
 
 # SparkJobDefinitionV1.json — metadata del job
 $sparkDefPayload = @{
-    executableFile             = "Main/$PythonFileName"
+    executableFile             = "$PythonFileName"
     defaultLakehouseArtifactId = $lakehouseId
     mainClass                  = ""
     additionalLakehouseIds     = @()
