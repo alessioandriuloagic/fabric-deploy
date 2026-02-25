@@ -243,71 +243,18 @@ if ($existingSJD) {
 
 # ─────────────────────────────────────────
 # 4. CREA DATA PIPELINE
+# NOTA: la creazione via API restituisce 500
+# (bug noto Fabric). La pipeline va creata
+# manualmente dal portal Fabric.
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 4: Data Pipeline ==="
-
-# pipeline-content.json: solo properties + activities
-$pipelinePayload = @{
-    properties = @{
-        activities = @(
-            @{
-                name      = "Run_BC_Sync"
-                type      = "TridentNotebook"
-                dependsOn = @()
-                policy    = @{
-                    timeout                = "0.12:00:00"
-                    retry                  = 0
-                    retryIntervalInSeconds = 30
-                    secureOutput           = $false
-                    secureInput            = $false
-                }
-                typeProperties = @{
-                    notebookId  = $sparkJobId
-                    workspaceId = $WorkspaceId
-                }
-            }
-        )
-    }
-} | ConvertTo-Json -Depth 10
-
-$pipelineListUrl  = "$baseUrl/items?type=DataPipeline"
-$existingPipeline = (Invoke-RestMethod -Uri "$baseUrl/items?type=DataPipeline" -Headers $headers -Method GET).value `
-                    | Where-Object { $_.displayName -eq $PipelineName }
-
-if ($existingPipeline) {
-    $pipelineId = $existingPipeline.id
-    Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
-} else {
-    Write-Host "  [NEW] Creo Data Pipeline '$PipelineName'..."
-
-    # Crea pipeline vuota via /items (endpoint piu stabile)
-    $pipelineBodyEmpty = @{
-        displayName = $PipelineName
-        type        = "DataPipeline"
-        description = "Pipeline orchestratore BC Sync"
-    } | ConvertTo-Json -Depth 5
-
-    $pipelineResult = Invoke-FabricApi -Method POST -Url "$baseUrl/items" -Headers $headers -Body $pipelineBodyEmpty
-    $pipelineId     = $pipelineResult.id
-    Write-Host "  [OK] Pipeline creata - ID: $pipelineId"
-
-    # Aggiorna definizione con le activity via updateDefinition
-    Write-Host "  [UPD] Aggiorno definizione pipeline..."
-    $updateUrl  = "$baseUrl/items/$pipelineId/updateDefinition"
-    $updateBody = @{
-        definition = @{
-            parts = @(@{
-                path        = "pipeline-content.json"
-                payload     = (To-Base64 $pipelinePayload)
-                payloadType = "InlineBase64"
-            })
-        }
-    } | ConvertTo-Json -Depth 10
-
-    Invoke-FabricApi -Method POST -Url $updateUrl -Headers $headers -Body $updateBody | Out-Null
-    Write-Host "  [OK] Definizione aggiornata"
-}
+Write-Host "  [SKIP] Creazione pipeline via API non supportata (bug Fabric 500)."
+Write-Host "  [INFO] Crea manualmente dal portal Fabric:"
+Write-Host "         1. Apri il workspace"
+Write-Host "         2. Nuovo item -> Data Pipeline -> Nome: $PipelineName"
+Write-Host "         3. Aggiungi activity: Spark Job -> seleziona $SparkJobName"
+$pipelineId = "DA-CREARE-MANUALMENTE"
 
 # ─────────────────────────────────────────
 # RIEPILOGO
