@@ -1,18 +1,18 @@
 # =============================================================
 # deploy.ps1 - Deploy completo soluzione Fabric
 # Compatibile con PowerShell 5.1 (Windows runner DevOps)
-# Ordine: 1) Upload Python -> 2) Mirroring DB -> 3) Spark Job -> 4) Pipeline
+# Ordine: 1) Lakehouse -> 2) Mirroring DB -> 3) Spark Job -> 4) Pipeline
 # =============================================================
 param(
     [Parameter(Mandatory=$true)][string]$TenantId,
     [Parameter(Mandatory=$true)][string]$ClientId,
     [Parameter(Mandatory=$true)][string]$ClientSecret,
     [Parameter(Mandatory=$true)][string]$WorkspaceId,
-    [Parameter(Mandatory=$true)][string]$LakehouseId,
-    [string]$PythonFileName  = "bc_sync.py",
+    [string]$LakehouseName   = "LH_BC_Landing",
     [string]$MirroringDbName = "MirrorDB_BC_Landing",
     [string]$SparkJobName    = "SJD_BC_To_Mirroring",
-    [string]$PipelineName    = "DP_BC_To_Mirroring"
+    [string]$PipelineName    = "DP_BC_To_Mirroring",
+    [string]$PythonFileName  = "bc_sync.py"
 )
 
 Set-StrictMode -Version Latest
@@ -37,17 +37,10 @@ function Invoke-FabricApi {
 
     $response = Invoke-WebRequest @params -UseBasicParsing
 
-    # Gestione Long Running Operation (202 Accepted)
     if ($response.StatusCode -eq 202) {
-        $locationUrl = $response.Headers["Location"]
-
-        # PS 5.1 non supporta ??, usiamo if/else
+        $locationUrl   = $response.Headers["Location"]
         $retryAfterRaw = $response.Headers["Retry-After"]
-        if ($retryAfterRaw) {
-            $retryAfter = [int]$retryAfterRaw
-        } else {
-            $retryAfter = 5
-        }
+        if ($retryAfterRaw) { $retryAfter = [int]$retryAfterRaw } else { $retryAfter = 5 }
 
         Write-Host "    [ASYNC] Polling ogni ${retryAfter}s..."
         do {
@@ -101,45 +94,27 @@ $baseUrl = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
 Write-Host "[OK] Token Fabric ottenuto"
 
 # ─────────────────────────────────────────
-# 1. UPLOAD FILE PYTHON SU LAKEHOUSE
-#    Via OneLake ADLS Gen2 API con token
-#    scope https://api.fabric.microsoft.com
+# 1. CREA LAKEHOUSE
 # ─────────────────────────────────────────
 Write-Host ""
-Write-Host "=== STEP 1: Upload Python sul Lakehouse ==="
+Write-Host "=== STEP 1: Lakehouse ==="
 
-$pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
-Write-Host "  Lettura file: $pythonLocalPath"
-$pythonBytes = [System.IO.File]::ReadAllBytes($pythonLocalPath)
+$lakehouseBody = @{
+    displayName = $LakehouseName
+    type        = "Lakehouse"
+    description = "Lakehouse BC - contiene script Python e dati di staging"
+} | ConvertTo-Json -Depth 5
 
-# Usa il token Fabric (stesso scope) per OneLake
-$onelakeHeaders = @{
-    Authorization  = "Bearer $token"
-    "x-ms-version" = "2023-01-03"
-}
-$onelakeUrl      = "https://onelake.dfs.fabric.microsoft.com"
-$pythonUploadUrl = "$onelakeUrl/$WorkspaceId/$LakehouseId/Files/Scripts/$PythonFileName"
+$lakehouseId = Get-OrCreate-Item `
+    -DisplayName $LakehouseName `
+    -Type        "Lakehouse" `
+    -CreateUrl   "$baseUrl/lakehouses" `
+    -ListUrl     "$baseUrl/lakehouses" `
+    -BodyJson    $lakehouseBody `
+    -Headers     $headers
 
-Write-Host "  Upload: $PythonFileName -> Files/Scripts/"
-
-# Step 1a: crea file vuoto
-Invoke-RestMethod -Uri "${pythonUploadUrl}?resource=file" `
-    -Method PUT -Headers $onelakeHeaders | Out-Null
-
-# Step 1b: append contenuto
-$appendHeaders = @{
-    Authorization    = "Bearer $token"
-    "x-ms-version"  = "2023-01-03"
-    "Content-Length" = $pythonBytes.Length.ToString()
-}
-Invoke-RestMethod -Uri "${pythonUploadUrl}?action=append&position=0" `
-    -Method PATCH -Headers $appendHeaders -Body $pythonBytes | Out-Null
-
-# Step 1c: flush (commit)
-Invoke-RestMethod -Uri "${pythonUploadUrl}?action=flush&position=$($pythonBytes.Length)" `
-    -Method PATCH -Headers $onelakeHeaders | Out-Null
-
-Write-Host "  [OK] Python caricato: Files/Scripts/$PythonFileName"
+Write-Host "  Lakehouse ID: $lakehouseId"
+Write-Host "  NOTA: caricare manualmente bc_sync.py in Files/Scripts/ del Lakehouse"
 
 # ─────────────────────────────────────────
 # 2. CREA MIRRORING DATABASE
@@ -197,7 +172,7 @@ Write-Host "=== STEP 3: Spark Job Definition ==="
 
 $sparkDefPayload = @{
     executableFile              = "Files/Scripts/$PythonFileName"
-    defaultLakehouseArtifactId  = $LakehouseId
+    defaultLakehouseArtifactId  = $lakehouseId
     defaultLakehouseWorkspaceId = $WorkspaceId
     mainClass                   = ""
     additionalLakehouseIds      = @()
@@ -284,13 +259,18 @@ Write-Host ""
 Write-Host "============================================"
 Write-Host "[OK] DEPLOY COMPLETATO"
 Write-Host "============================================"
-Write-Host "  Mirroring Database : $mirroringId"
-Write-Host "  Spark Job          : $sparkJobId"
-Write-Host "  Data Pipeline      : $pipelineId"
-Write-Host "  Python             : Files/Scripts/$PythonFileName"
+Write-Host "  Lakehouse         : $lakehouseId"
+Write-Host "  Mirroring Database: $mirroringId"
+Write-Host "  Spark Job         : $sparkJobId"
+Write-Host "  Data Pipeline     : $pipelineId"
 Write-Host "============================================"
+Write-Host ""
+Write-Host "PROSSIMO STEP:"
+Write-Host "  Carica bc_sync.py nel Lakehouse:"
+Write-Host "  $LakehouseName -> Files -> Scripts -> bc_sync.py"
+Write-Host ""
 
-# Esporta ID come variabili DevOps per step successivi
+Write-Host "##vso[task.setvariable variable=LAKEHOUSE_ID]$lakehouseId"
 Write-Host "##vso[task.setvariable variable=MIRRORING_ID]$mirroringId"
 Write-Host "##vso[task.setvariable variable=SPARK_JOB_ID]$sparkJobId"
 Write-Host "##vso[task.setvariable variable=PIPELINE_ID]$pipelineId"
