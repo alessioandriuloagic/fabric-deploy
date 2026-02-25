@@ -271,30 +271,30 @@ $pipelinePayload = @{
     }
 } | ConvertTo-Json -Depth 10
 
-$pipelineListUrl  = "$baseUrl/dataPipelines"
-$existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
+$pipelineListUrl  = "$baseUrl/items?type=DataPipeline"
+$existingPipeline = (Invoke-RestMethod -Uri "$baseUrl/items?type=DataPipeline" -Headers $headers -Method GET).value `
                     | Where-Object { $_.displayName -eq $PipelineName }
 
 if ($existingPipeline) {
     $pipelineId = $existingPipeline.id
     Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
 } else {
-    Write-Host "  [NEW] Creo Data Pipeline vuota '$PipelineName'..."
+    Write-Host "  [NEW] Creo Data Pipeline '$PipelineName'..."
 
-    # Step 1: crea pipeline VUOTA (senza definition)
-    # L API rifiuta definition con riferimenti a item ID al momento della creazione
+    # Crea pipeline vuota via /items (endpoint piu stabile)
     $pipelineBodyEmpty = @{
         displayName = $PipelineName
+        type        = "DataPipeline"
         description = "Pipeline orchestratore BC Sync"
     } | ConvertTo-Json -Depth 5
 
-    $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBodyEmpty
+    $pipelineResult = Invoke-FabricApi -Method POST -Url "$baseUrl/items" -Headers $headers -Body $pipelineBodyEmpty
     $pipelineId     = $pipelineResult.id
     Write-Host "  [OK] Pipeline creata - ID: $pipelineId"
 
-    # Step 2: aggiorna la definizione con le activity
-    Write-Host "  [UPD] Aggiorno definizione pipeline con Spark Job activity..."
-    $updateUrl  = "$baseUrl/dataPipelines/$pipelineId/updateDefinition"
+    # Aggiorna definizione con le activity via updateDefinition
+    Write-Host "  [UPD] Aggiorno definizione pipeline..."
+    $updateUrl  = "$baseUrl/items/$pipelineId/updateDefinition"
     $updateBody = @{
         definition = @{
             parts = @(@{
