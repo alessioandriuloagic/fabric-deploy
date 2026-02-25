@@ -35,7 +35,14 @@ function Invoke-FabricApi {
     $params = @{ Method = $Method; Uri = $Url; Headers = $Headers }
     if ($Body) { $params["Body"] = $Body }
 
-    $response = Invoke-WebRequest @params -UseBasicParsing
+    try {
+        $response = Invoke-WebRequest @params -UseBasicParsing
+    } catch {
+        $errBody = $_.ErrorDetails.Message
+        if (-not $errBody) { $errBody = $_.Exception.Message }
+        Write-Host "##[error] API Error Body: $errBody"
+        throw
+    }
 
     if ($response.StatusCode -eq 202) {
         $locationUrl   = $response.Headers["Location"]
