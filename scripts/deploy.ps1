@@ -165,42 +165,69 @@ if ($existingMirror) {
 }
 
 # ─────────────────────────────────────────
-# 3. CREA SPARK JOB DEFINITION
+# 3. CREA SPARK JOB DEFINITION (V2)
+#    Include il file Python direttamente
+#    nel payload - nessun upload separato
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 3: Spark Job Definition ==="
 
+# Leggi il file Python dal repo e codificalo in base64
+$pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
+Write-Host "  Lettura Python: $pythonLocalPath"
+$pythonBytes  = [System.IO.File]::ReadAllBytes($pythonLocalPath)
+$pythonBase64 = [Convert]::ToBase64String($pythonBytes)
+
+# SparkJobDefinitionV1.json — metadata del job
 $sparkDefPayload = @{
-    executableFile              = "Files/Scripts/$PythonFileName"
+    executableFile              = "Main/$PythonFileName"
     defaultLakehouseArtifactId  = $lakehouseId
     defaultLakehouseWorkspaceId = $WorkspaceId
     mainClass                   = ""
     additionalLakehouseIds      = @()
     retryPolicy                 = $null
     commandLineArguments        = ""
+    additionalLibraryUris       = @()
+    language                    = "Python"
     environmentArtifactId       = $null
     environmentWorkspaceId      = $null
 } | ConvertTo-Json -Depth 10
 
-$sparkBody = @{
-    displayName = $SparkJobName
-    type        = "SparkJobDefinition"
-    definition  = @{
-        parts = @(@{
-            path        = "SparkJobDefinitionV1.json"
-            payload     = (To-Base64 $sparkDefPayload)
-            payloadType = "InlineBase64"
-        })
-    }
-} | ConvertTo-Json -Depth 10
+# Controlla se esiste gia
+$existingSJD = (Invoke-RestMethod -Uri "$baseUrl/sparkJobDefinitions" -Headers $headers -Method GET).value `
+               | Where-Object { $_.displayName -eq $SparkJobName }
 
-$sparkJobId = Get-OrCreate-Item `
-    -DisplayName $SparkJobName `
-    -Type        "SparkJobDefinition" `
-    -CreateUrl   "$baseUrl/items" `
-    -ListUrl     "$baseUrl/items" `
-    -BodyJson    $sparkBody `
-    -Headers     $headers
+if ($existingSJD) {
+    $sparkJobId = $existingSJD.id
+    Write-Host "  [OK] Spark Job gia esistente - ID: $sparkJobId"
+} else {
+    Write-Host "  [NEW] Creo Spark Job Definition '$SparkJobName' (V2 con Python incluso)..."
+
+    # Formato V2: include il file Python direttamente nel payload
+    $sparkBody = @{
+        displayName = $SparkJobName
+        description = "Spark Job BC Sync - legge da BC e scrive su Mirroring Landing Zone"
+        definition  = @{
+            format = "SparkJobDefinitionV2"
+            parts  = @(
+                @{
+                    path        = "SparkJobDefinitionV1.json"
+                    payload     = (To-Base64 $sparkDefPayload)
+                    payloadType = "InlineBase64"
+                },
+                @{
+                    path        = "Main/$PythonFileName"
+                    payload     = $pythonBase64
+                    payloadType = "InlineBase64"
+                }
+            )
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $sjdResult  = Invoke-FabricApi -Method POST -Url "$baseUrl/sparkJobDefinitions" -Headers $headers -Body $sparkBody
+    $sparkJobId = $sjdResult.id
+    Write-Host "  [OK] Creato - ID: $sparkJobId"
+}
 
 # ─────────────────────────────────────────
 # 4. CREA DATA PIPELINE
