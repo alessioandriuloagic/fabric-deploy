@@ -15,7 +15,6 @@ param(
     [string]$PythonFileName  = "bc_sync.py"
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ─────────────────────────────────────────
@@ -38,9 +37,13 @@ function Invoke-FabricApi {
     try {
         $response = Invoke-WebRequest @params -UseBasicParsing
     } catch {
-        $errBody = $_.ErrorDetails.Message
-        if (-not $errBody) { $errBody = $_.Exception.Message }
-        Write-Host "##[error] API Error Body: $errBody"
+        $errDetails = $_.ErrorDetails
+        $errMsg     = $_.Exception.ToString()
+        if ($errDetails -ne $null) {
+            Write-Host "##[error] API Error: $errDetails"
+        } else {
+            Write-Host "##[error] API Error: $errMsg"
+        }
         throw
     }
 
