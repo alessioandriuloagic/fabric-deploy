@@ -97,42 +97,41 @@ $headers = @{
     Authorization  = "Bearer $token"
     "Content-Type" = "application/json"
 }
-$baseUrl    = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
-$onelakeUrl = "https://onelake.dfs.fabric.microsoft.com"
+$baseUrl = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
 Write-Host "[OK] Token Fabric ottenuto"
 
 # ─────────────────────────────────────────
 # 1. UPLOAD FILE PYTHON SU LAKEHOUSE
+#    Via OneLake ADLS Gen2 API con token
+#    scope https://api.fabric.microsoft.com
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 1: Upload Python sul Lakehouse ==="
 
-$onelakeTokenBody = @{
-    grant_type    = "client_credentials"
-    client_id     = $ClientId
-    client_secret = $ClientSecret
-    scope         = "https://storage.azure.com/.default"
-}
-$onelakeToken   = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $onelakeTokenBody).access_token
+$pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
+Write-Host "  Lettura file: $pythonLocalPath"
+$pythonBytes = [System.IO.File]::ReadAllBytes($pythonLocalPath)
+
+# Usa il token Fabric (stesso scope) per OneLake
 $onelakeHeaders = @{
-    Authorization  = "Bearer $onelakeToken"
+    Authorization  = "Bearer $token"
     "x-ms-version" = "2023-01-03"
 }
-
-$pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
+$onelakeUrl      = "https://onelake.dfs.fabric.microsoft.com"
 $pythonUploadUrl = "$onelakeUrl/$WorkspaceId/$LakehouseId/Files/Scripts/$PythonFileName"
 
 Write-Host "  Upload: $PythonFileName -> Files/Scripts/"
-
-$pythonBytes = [System.IO.File]::ReadAllBytes($pythonLocalPath)
 
 # Step 1a: crea file vuoto
 Invoke-RestMethod -Uri "${pythonUploadUrl}?resource=file" `
     -Method PUT -Headers $onelakeHeaders | Out-Null
 
 # Step 1b: append contenuto
-$appendHeaders = $onelakeHeaders.Clone()
-$appendHeaders["Content-Length"] = $pythonBytes.Length.ToString()
+$appendHeaders = @{
+    Authorization    = "Bearer $token"
+    "x-ms-version"  = "2023-01-03"
+    "Content-Length" = $pythonBytes.Length.ToString()
+}
 Invoke-RestMethod -Uri "${pythonUploadUrl}?action=append&position=0" `
     -Method PATCH -Headers $appendHeaders -Body $pythonBytes | Out-Null
 
