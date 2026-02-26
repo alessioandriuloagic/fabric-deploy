@@ -249,30 +249,35 @@ if ($existingSJD) {
 Write-Host ""
 Write-Host "=== STEP 4: Data Pipeline ==="
 
-# Definizione JSON della pipeline (formato Fabric)
-$pipelineDefinition = @{
-    name       = $PipelineName
-    properties = @{
-        activities = @(
-            @{
-                name      = $SparkJobName
-                type      = "FabricSparkJobDefinition"
-                dependsOn = @()
-                policy    = @{
-                    timeout                = "0.12:00:00"
-                    retry                  = 0
-                    retryIntervalInSeconds = 30
-                    secureOutput           = $false
-                    secureInput            = $false
-                }
-                typeProperties = @{
-                    sparkJobDefinitionId = $sparkJobId
-                    workspaceId          = $WorkspaceId
+# Definizione JSON della pipeline (here-string per controllo totale)
+Write-Host "  Spark Job ID: $sparkJobId"
+Write-Host "  Workspace ID: $WorkspaceId"
+
+$pipelineDefinition = @"
+{
+    "name": "$PipelineName",
+    "properties": {
+        "activities": [
+            {
+                "name": "$SparkJobName",
+                "type": "FabricSparkJobDefinition",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "sparkJobDefinitionId": "$sparkJobId",
+                    "workspaceId": "$WorkspaceId"
                 }
             }
-        )
+        ]
     }
-} | ConvertTo-Json -Depth 10
+}
+"@
 
 # Controlla se esiste gia
 $pipelineListUrl  = "$baseUrl/dataPipelines"
