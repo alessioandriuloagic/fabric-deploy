@@ -181,6 +181,13 @@ if ($existingMirror) {
     Write-Host "  [NEW] Creo Mirroring Database '$MirroringDbName'..."
     $mirrorResult = Invoke-FabricApi -Method POST -Url $mirrorListUrl -Headers $headers -Body $mirroringBody
     $mirroringId  = $mirrorResult.id
+    if ([string]::IsNullOrWhiteSpace($mirroringId)) {
+        Write-Host "  [INFO] Risposta async senza ID, recupero dalla lista..."
+        Start-Sleep -Seconds 3
+        $createdMirror = (Invoke-RestMethod -Uri $mirrorListUrl -Headers $headers -Method GET).value `
+                         | Where-Object { $_.displayName -eq $MirroringDbName }
+        $mirroringId = $createdMirror.id
+    }
     Write-Host "  [OK] Creato - ID: $mirroringId"
 }
 
@@ -256,7 +263,17 @@ if ($existingSJD) {
     } | ConvertTo-Json -Depth 10
 
     $sjdResult  = Invoke-FabricApi -Method POST -Url "$baseUrl/sparkJobDefinitions" -Headers $headers -Body $sparkBody
+
+    # L'API asincrona (202) non restituisce l'ID nell'operazione.
+    # Recupero l'ID con un GET sulla lista dopo la creazione.
     $sparkJobId = $sjdResult.id
+    if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
+        Write-Host "  [INFO] Risposta async senza ID, recupero dalla lista..."
+        Start-Sleep -Seconds 3
+        $createdSJD = (Invoke-RestMethod -Uri "$baseUrl/sparkJobDefinitions" -Headers $headers -Method GET).value `
+                      | Where-Object { $_.displayName -eq $SparkJobName }
+        $sparkJobId = $createdSJD.id
+    }
     Write-Host "  [OK] Creato - ID: $sparkJobId"
 }
 
@@ -382,6 +399,13 @@ if ($existingPipeline) {
 
     $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBody
     $pipelineId     = $pipelineResult.id
+    if ([string]::IsNullOrWhiteSpace($pipelineId)) {
+        Write-Host "  [INFO] Risposta async senza ID, recupero dalla lista..."
+        Start-Sleep -Seconds 3
+        $createdPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
+                           | Where-Object { $_.displayName -eq $PipelineName }
+        $pipelineId = $createdPipeline.id
+    }
     Write-Host "  [OK] Creato - ID: $pipelineId"
 }
 
