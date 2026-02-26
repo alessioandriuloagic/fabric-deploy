@@ -70,12 +70,15 @@ stages:
             inputs:
               filePath: "scripts/deploy.ps1"
               arguments: >
-                -TenantId      "$(FABRIC_TENANT_ID)"
-                -ClientId      "$(FABRIC_CLIENT_ID)"
-                -ClientSecret  "$(FABRIC_CLIENT_SECRET)"
-                -WorkspaceId   "$(FABRIC_WORKSPACE_ID)"
-                -BcTenantId    "$(BC_TENANT_ID)"
-                -BcEnvironment "$(BC_ENVIRONMENT)"
-                -BcCompanies   "$(BC_COMPANIES)"
-                -BcEntities    "$(BC_ENTITIES)"
+                -TenantId       "$(FABRIC_TENANT_ID)"
+                -ClientId       "$(FABRIC_CLIENT_ID)"
+                -ClientSecret   "$(FABRIC_CLIENT_SECRET)"
+                -WorkspaceId    "$(FABRIC_WORKSPACE_ID)"
+                -BcTenantId     "$(BC_TENANT_ID)"
+                -BcEnvironment  "$(BC_ENVIRONMENT)"
+                -BcCompanies    "$env:BC_COMPANIES"
+                -BcEntities     "$env:BC_ENTITIES"
                 -PythonFileName "$(PYTHON_FILE_NAME)"
+            env:
+              BC_COMPANIES: $(BC_COMPANIES)
+              BC_ENTITIES:  $(BC_ENTITIES)
