@@ -36,9 +36,9 @@ def _get_param(name, default=None):
     return os.environ.get(name, default)
 
 # Business Central
-BC_TENANT_ID     = _get_param("BC_TENANT_ID",     "90a00338-fdb2-432e-9cc0-a95bdd12d0ff")
-BC_CLIENT_ID     = _get_param("BC_CLIENT_ID",     "98e82bae-baf4-4adb-8083-800359a6bdd1")
-BC_CLIENT_SECRET = _get_param("BC_CLIENT_SECRET", "REPLACE_ME")   # mai hardcoded in prod
+BC_TENANT_ID     = _get_param("BC_TENANT_ID")
+BC_CLIENT_ID     = _get_param("BC_CLIENT_ID")
+BC_CLIENT_SECRET = _get_param("BC_CLIENT_SECRET")
 
 ENVIRONMENT = _get_param("BC_ENVIRONMENT", "SandboxTest")
 
@@ -51,15 +51,30 @@ _entities_raw = _get_param("BC_ENTITIES", '["ItemLedgerEntries"]')
 ENTITIES = json.loads(_entities_raw)
 
 # OneLake
-WORKSPACE_ID      = _get_param("FABRIC_WORKSPACE_ID",  "d4df6555-c1c0-4fa8-b968-e335aaf649b5")
-LAKEHOUSE_ID      = _get_param("FABRIC_LAKEHOUSE_ID",  "01702e59-3071-4da8-a1b3-2532772e36ff")
+WORKSPACE_ID      = _get_param("FABRIC_WORKSPACE_ID")
+LAKEHOUSE_ID      = _get_param("FABRIC_LAKEHOUSE_ID")
 TARGET_FOLDER     = "Files/LandingZone"
 KEYS_TARGET_FOLDER = "Files/MirroringKeys"
 
-# OneLake Service Principal (può essere lo stesso SP del deploy o uno dedicato)
+# OneLake Service Principal (stessa App Registration usata per Fabric e BC)
 ONELAKE_TENANT_ID     = _get_param("FABRIC_TENANT_ID",     BC_TENANT_ID)
 ONELAKE_CLIENT_ID     = _get_param("FABRIC_CLIENT_ID",     BC_CLIENT_ID)
 ONELAKE_CLIENT_SECRET = _get_param("FABRIC_CLIENT_SECRET", BC_CLIENT_SECRET)
+
+# Validazione: verifica che i parametri obbligatori siano presenti
+_required = {
+    "BC_TENANT_ID": BC_TENANT_ID,
+    "BC_CLIENT_ID": BC_CLIENT_ID,
+    "BC_CLIENT_SECRET": BC_CLIENT_SECRET,
+    "FABRIC_WORKSPACE_ID": WORKSPACE_ID,
+    "FABRIC_LAKEHOUSE_ID": LAKEHOUSE_ID,
+}
+_missing = [k for k, v in _required.items() if not v]
+if _missing:
+    raise RuntimeError(
+        f"Parametri obbligatori mancanti: {', '.join(_missing)}. "
+        f"Passarli come --KEY value nello Spark Job o come variabili d'ambiente."
+    )
 
 # State file — salvato su OneLake invece che in locale
 STATE_FILE = f"{LAKEHOUSE_ID}/Files/MirroringState/.mirroring_state.json"

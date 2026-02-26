@@ -12,7 +12,13 @@ param(
     [string]$MirroringDbName = "MirrorDB_BC_Landing",
     [string]$SparkJobName    = "SJD_BC_To_Mirroring",
     [string]$PipelineName    = "DP_BC_To_Mirroring",
-    [string]$PythonFileName  = "bc_sync.py"
+    [string]$PythonFileName  = "bc_sync.py",
+
+    # ── Parametri BC (da DevOps Library) ──
+    [Parameter(Mandatory=$true)][string]$BcTenantId,
+    [string]$BcEnvironment   = "SandboxTest",
+    [string]$BcCompanies     = '["CRONUS%20IT"]',
+    [string]$BcEntities      = '["ItemLedgerEntries"]'
 )
 
 $ErrorActionPreference = "Stop"
@@ -181,7 +187,9 @@ if ($existingMirror) {
 # ─────────────────────────────────────────
 # 3. CREA SPARK JOB DEFINITION (V2)
 #    Include il file Python direttamente
-#    nel payload - nessun upload separato
+#    nel payload - nessun upload separato.
+#    I parametri BC vengono iniettati come
+#    commandLineArguments (--KEY value).
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 3: Spark Job Definition ==="
@@ -192,6 +200,24 @@ Write-Host "  Lettura Python: $pythonLocalPath"
 $pythonBytes  = [System.IO.File]::ReadAllBytes($pythonLocalPath)
 $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
 
+# ── Costruisci commandLineArguments ──
+# ClientId e ClientSecret sono condivisi tra Fabric e BC (stessa App Registration)
+$sparkArgs = @(
+    "--BC_TENANT_ID",       $BcTenantId,
+    "--BC_CLIENT_ID",       $ClientId,
+    "--BC_CLIENT_SECRET",   $ClientSecret,
+    "--BC_ENVIRONMENT",     $BcEnvironment,
+    "--BC_COMPANIES",       ("'" + $BcCompanies + "'"),
+    "--BC_ENTITIES",        ("'" + $BcEntities  + "'"),
+    "--FABRIC_WORKSPACE_ID", $WorkspaceId,
+    "--FABRIC_LAKEHOUSE_ID", $lakehouseId,
+    "--FABRIC_TENANT_ID",    $TenantId,
+    "--FABRIC_CLIENT_ID",    $ClientId,
+    "--FABRIC_CLIENT_SECRET", $ClientSecret
+) -join " "
+
+Write-Host "  commandLineArguments: $sparkArgs"
+
 # SparkJobDefinitionV1.json — metadata del job
 $sparkDefPayload = @{
     executableFile             = "$PythonFileName"
@@ -199,11 +225,28 @@ $sparkDefPayload = @{
     mainClass                  = ""
     additionalLakehouseIds     = @()
     retryPolicy                = $null
-    commandLineArguments       = ""
+    commandLineArguments       = $sparkArgs
     additionalLibraryUris      = @()
     language                   = "Python"
     environmentArtifactId      = $null
 } | ConvertTo-Json -Depth 10
+
+# Definizione completa V2 (riusata sia per create che update)
+$sparkDefinition = @{
+    format = "SparkJobDefinitionV2"
+    parts  = @(
+        @{
+            path        = "SparkJobDefinitionV1.json"
+            payload     = (To-Base64 $sparkDefPayload)
+            payloadType = "InlineBase64"
+        },
+        @{
+            path        = "Main/$PythonFileName"
+            payload     = $pythonBase64
+            payloadType = "InlineBase64"
+        }
+    )
+}
 
 # Controlla se esiste gia
 $existingSJD = (Invoke-RestMethod -Uri "$baseUrl/sparkJobDefinitions" -Headers $headers -Method GET).value `
@@ -212,28 +255,22 @@ $existingSJD = (Invoke-RestMethod -Uri "$baseUrl/sparkJobDefinitions" -Headers $
 if ($existingSJD) {
     $sparkJobId = $existingSJD.id
     Write-Host "  [OK] Spark Job gia esistente - ID: $sparkJobId"
+
+    # Aggiorna definizione (Python + parametri) per sincronizzare con DevOps
+    Write-Host "  [UPD] Aggiorno definizione (codice Python + parametri)..."
+    $updateBody = @{ definition = $sparkDefinition } | ConvertTo-Json -Depth 10
+    Invoke-FabricApi -Method POST `
+        -Url "$baseUrl/sparkJobDefinitions/$sparkJobId/updateDefinition" `
+        -Headers $headers `
+        -Body $updateBody
+    Write-Host "  [OK] Definizione aggiornata"
 } else {
     Write-Host "  [NEW] Creo Spark Job Definition '$SparkJobName' (V2 con Python incluso)..."
 
-    # Formato V2: include il file Python direttamente nel payload
     $sparkBody = @{
         displayName = $SparkJobName
         description = "Spark Job BC Sync - legge da BC e scrive su Mirroring Landing Zone"
-        definition  = @{
-            format = "SparkJobDefinitionV2"
-            parts  = @(
-                @{
-                    path        = "SparkJobDefinitionV1.json"
-                    payload     = (To-Base64 $sparkDefPayload)
-                    payloadType = "InlineBase64"
-                },
-                @{
-                    path        = "Main/$PythonFileName"
-                    payload     = $pythonBase64
-                    payloadType = "InlineBase64"
-                }
-            )
-        }
+        definition  = $sparkDefinition
     } | ConvertTo-Json -Depth 10
 
     $sjdResult  = Invoke-FabricApi -Method POST -Url "$baseUrl/sparkJobDefinitions" -Headers $headers -Body $sparkBody
