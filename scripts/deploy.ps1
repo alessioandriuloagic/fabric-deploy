@@ -243,18 +243,82 @@ if ($existingSJD) {
 
 # ─────────────────────────────────────────
 # 4. CREA DATA PIPELINE
-# NOTA: la creazione via API restituisce 500
-# (bug noto Fabric). La pipeline va creata
-# manualmente dal portal Fabric.
+#    Contiene un'activity Spark Job Definition
+#    che punta al job creato nello step 3
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 4: Data Pipeline ==="
-Write-Host "  [SKIP] Creazione pipeline via API non supportata (bug Fabric 500)."
-Write-Host "  [INFO] Crea manualmente dal portal Fabric:"
-Write-Host "         1. Apri il workspace"
-Write-Host "         2. Nuovo item -> Data Pipeline -> Nome: $PipelineName"
-Write-Host "         3. Aggiungi activity: Spark Job -> seleziona $SparkJobName"
-$pipelineId = "DA-CREARE-MANUALMENTE"
+
+# Definizione JSON della pipeline (formato Fabric)
+$pipelineDefinition = @{
+    name       = $PipelineName
+    properties = @{
+        activities = @(
+            @{
+                name      = $SparkJobName
+                type      = "FabricSparkJobDefinition"
+                dependsOn = @()
+                policy    = @{
+                    timeout                = "0.12:00:00"
+                    retry                  = 0
+                    retryIntervalInSeconds = 30
+                    secureOutput           = $false
+                    secureInput            = $false
+                }
+                typeProperties = @{
+                    sparkJobDefinitionId = $sparkJobId
+                    workspaceId          = $WorkspaceId
+                }
+            }
+        )
+    }
+} | ConvertTo-Json -Depth 10
+
+# Controlla se esiste gia
+$pipelineListUrl  = "$baseUrl/dataPipelines"
+$existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
+                    | Where-Object { $_.displayName -eq $PipelineName }
+
+if ($existingPipeline) {
+    $pipelineId = $existingPipeline.id
+    Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
+
+    # Aggiorna la definizione della pipeline esistente
+    Write-Host "  [UPD] Aggiorno la definizione della pipeline..."
+    $updateBody = @{
+        definition = @{
+            parts = @(@{
+                path        = "pipeline-content.json"
+                payload     = (To-Base64 $pipelineDefinition)
+                payloadType = "InlineBase64"
+            })
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-FabricApi -Method POST `
+        -Url "$baseUrl/dataPipelines/$pipelineId/updateDefinition" `
+        -Headers $headers `
+        -Body $updateBody
+    Write-Host "  [OK] Definizione aggiornata"
+} else {
+    Write-Host "  [NEW] Creo Data Pipeline '$PipelineName'..."
+
+    $pipelineBody = @{
+        displayName = $PipelineName
+        description = "Pipeline BC - esegue Spark Job $SparkJobName"
+        definition  = @{
+            parts = @(@{
+                path        = "pipeline-content.json"
+                payload     = (To-Base64 $pipelineDefinition)
+                payloadType = "InlineBase64"
+            })
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBody
+    $pipelineId     = $pipelineResult.id
+    Write-Host "  [OK] Creato - ID: $pipelineId"
+}
 
 # ─────────────────────────────────────────
 # RIEPILOGO
