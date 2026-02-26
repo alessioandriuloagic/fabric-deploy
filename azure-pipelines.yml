@@ -34,7 +34,10 @@ stages:
             inputs:
               targetType: inline
               script: |
-                $required = @("FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID")
+                $required = @(
+                  "FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID",
+                  "BC_TENANT_ID","BC_ENVIRONMENT","BC_COMPANIES","BC_ENTITIES"
+                )
                 $ok = $true
                 foreach ($v in $required) {
                   $val = [System.Environment]::GetEnvironmentVariable($v)
@@ -42,7 +45,12 @@ stages:
                     Write-Host "##vso[task.logissue type=error]Variabile mancante: $v"
                     $ok = $false
                   } else {
-                    Write-Host "[OK] $v"
+                    # Non stampare il valore dei secret
+                    if ($v -like "*SECRET*") {
+                      Write-Host "[OK] $v = ********"
+                    } else {
+                      Write-Host "[OK] $v = $val"
+                    }
                   }
                 }
                 if (-not $ok) { exit 1 }
@@ -51,6 +59,10 @@ stages:
               FABRIC_CLIENT_ID:     $(FABRIC_CLIENT_ID)
               FABRIC_CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
               FABRIC_WORKSPACE_ID:  $(FABRIC_WORKSPACE_ID)
+              BC_TENANT_ID:         $(BC_TENANT_ID)
+              BC_ENVIRONMENT:       $(BC_ENVIRONMENT)
+              BC_COMPANIES:         $(BC_COMPANIES)
+              BC_ENTITIES:          $(BC_ENTITIES)
 
           # -- Deploy tutti gli item Fabric --
           - task: PowerShell@2
@@ -58,7 +70,12 @@ stages:
             inputs:
               filePath: "scripts/deploy.ps1"
               arguments: >
-                -TenantId     "$(FABRIC_TENANT_ID)"
-                -ClientId     "$(FABRIC_CLIENT_ID)"
-                -ClientSecret "$(FABRIC_CLIENT_SECRET)"
-                -WorkspaceId  "$(FABRIC_WORKSPACE_ID)"
+                -TenantId      "$(FABRIC_TENANT_ID)"
+                -ClientId      "$(FABRIC_CLIENT_ID)"
+                -ClientSecret  "$(FABRIC_CLIENT_SECRET)"
+                -WorkspaceId   "$(FABRIC_WORKSPACE_ID)"
+                -BcTenantId    "$(BC_TENANT_ID)"
+                -BcEnvironment "$(BC_ENVIRONMENT)"
+                -BcCompanies   "$(BC_COMPANIES)"
+                -BcEntities    "$(BC_ENTITIES)"
+                -PythonFileName "$(PYTHON_FILE_NAME)"
