@@ -188,8 +188,8 @@ if ($existingMirror) {
 # 3. CREA SPARK JOB DEFINITION (V2)
 #    Include il file Python direttamente
 #    nel payload - nessun upload separato.
-#    I parametri BC vengono iniettati come
-#    commandLineArguments (--KEY value).
+#    I parametri vengono passati dalla Pipeline
+#    (non dallo Spark Job) via commandLineArguments.
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== STEP 3: Spark Job Definition ==="
@@ -200,32 +200,14 @@ Write-Host "  Lettura Python: $pythonLocalPath"
 $pythonBytes  = [System.IO.File]::ReadAllBytes($pythonLocalPath)
 $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
 
-# ── Costruisci commandLineArguments ──
-# ClientId e ClientSecret sono condivisi tra Fabric e BC (stessa App Registration)
-$sparkArgs = @(
-    "--BC_TENANT_ID",       $BcTenantId,
-    "--BC_CLIENT_ID",       $ClientId,
-    "--BC_CLIENT_SECRET",   $ClientSecret,
-    "--BC_ENVIRONMENT",     $BcEnvironment,
-    "--BC_COMPANIES",       ("'" + $BcCompanies + "'"),
-    "--BC_ENTITIES",        ("'" + $BcEntities  + "'"),
-    "--FABRIC_WORKSPACE_ID", $WorkspaceId,
-    "--FABRIC_LAKEHOUSE_ID", $lakehouseId,
-    "--FABRIC_TENANT_ID",    $TenantId,
-    "--FABRIC_CLIENT_ID",    $ClientId,
-    "--FABRIC_CLIENT_SECRET", $ClientSecret
-) -join " "
-
-Write-Host "  commandLineArguments: $sparkArgs"
-
-# SparkJobDefinitionV1.json — metadata del job
+# SparkJobDefinitionV1.json — metadata del job (senza commandLineArguments, li passa la pipeline)
 $sparkDefPayload = @{
     executableFile             = "$PythonFileName"
     defaultLakehouseArtifactId = $lakehouseId
     mainClass                  = ""
     additionalLakehouseIds     = @()
     retryPolicy                = $null
-    commandLineArguments       = $sparkArgs
+    commandLineArguments       = ""
     additionalLibraryUris      = @()
     language                   = "Python"
     environmentArtifactId      = $null
@@ -256,8 +238,8 @@ if ($existingSJD) {
     $sparkJobId = $existingSJD.id
     Write-Host "  [OK] Spark Job gia esistente - ID: $sparkJobId"
 
-    # Aggiorna definizione (Python + parametri) per sincronizzare con DevOps
-    Write-Host "  [UPD] Aggiorno definizione (codice Python + parametri)..."
+    # Aggiorna definizione (Python) per sincronizzare con DevOps
+    Write-Host "  [UPD] Aggiorno definizione (codice Python)..."
     $updateBody = @{ definition = $sparkDefinition } | ConvertTo-Json -Depth 10
     Invoke-FabricApi -Method POST `
         -Url "$baseUrl/sparkJobDefinitions/$sparkJobId/updateDefinition" `
@@ -289,10 +271,44 @@ Write-Host "=== STEP 4: Data Pipeline ==="
 # Definizione JSON della pipeline (here-string per controllo totale)
 Write-Host "  Spark Job ID: $sparkJobId"
 Write-Host "  Workspace ID: $WorkspaceId"
+Write-Host "  Lakehouse ID: $lakehouseId"
+
+# Sicurezza: forza ID a stringhe pulite (in caso di oggetti PS)
+$sparkJobId  = [string]$sparkJobId
+$WorkspaceId = [string]$WorkspaceId
+$lakehouseId = [string]$lakehouseId
+
+if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
+    Write-Host "##[error] sparkJobId e' vuoto! Impossibile creare la pipeline."
+    exit 1
+}
+
+# ── Costruisci commandLineArguments per la pipeline ──
+# I valori JSON (companies, entities) vengono codificati in Base64
+# per evitare problemi di parsing con spazi e caratteri speciali.
+$companiesB64 = To-Base64 $BcCompanies
+$entitiesB64  = To-Base64 $BcEntities
+
+$sparkArgs = @(
+    "--BC_TENANT_ID",        $BcTenantId,
+    "--BC_CLIENT_ID",        $ClientId,
+    "--BC_CLIENT_SECRET",    $ClientSecret,
+    "--BC_ENVIRONMENT",      $BcEnvironment,
+    "--BC_COMPANIES_B64",    $companiesB64,
+    "--BC_ENTITIES_B64",     $entitiesB64,
+    "--FABRIC_WORKSPACE_ID", $WorkspaceId,
+    "--FABRIC_LAKEHOUSE_ID", $lakehouseId,
+    "--FABRIC_TENANT_ID",    $TenantId,
+    "--FABRIC_CLIENT_ID",    $ClientId,
+    "--FABRIC_CLIENT_SECRET", $ClientSecret
+) -join " "
+
+Write-Host "  commandLineArguments costruiti (companies/entities in Base64)"
 
 $pipelineDefinition = @"
 {
     "name": "$PipelineName",
+    "objectId": "$(([guid]::NewGuid()).ToString())",
     "properties": {
         "activities": [
             {
@@ -308,13 +324,20 @@ $pipelineDefinition = @"
                 },
                 "typeProperties": {
                     "sparkJobDefinitionId": "$sparkJobId",
-                    "workspaceId": "$WorkspaceId"
+                    "workspaceId": "$WorkspaceId",
+                    "commandLineArguments": "$sparkArgs",
+                    "defaultLakehouse": {
+                        "workspaceId": "$WorkspaceId",
+                        "artifactId": "$lakehouseId"
+                    }
                 }
             }
         ]
     }
 }
 "@
+
+Write-Host "  [DEBUG] Pipeline definition creata"
 
 # Controlla se esiste gia
 $pipelineListUrl  = "$baseUrl/dataPipelines"

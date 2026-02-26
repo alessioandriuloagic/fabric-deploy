@@ -4,6 +4,7 @@ import os
 import re
 import json
 import numpy as np
+import base64
 from datetime import datetime, timedelta
 from azure.identity import ClientSecretCredential   # <-- niente più browser
 from azure.storage.filedatalake import DataLakeServiceClient
@@ -21,18 +22,17 @@ import sys
 
 def _get_param(name, default=None):
     """
-    Legge un parametro dallo Spark Job argument string oppure da env var.
-    Lo Spark Job in Fabric passa i parametri come: --KEY value
+    Legge un parametro dallo Spark Job commandLineArguments oppure da env var.
+    Lo Spark Job in Fabric passa i parametri come: --KEY value (in sys.argv).
+    Nota: mssparkutils.notebook/runtime NON è disponibile per Spark Job Definitions.
     """
-    try:
-        # Prova prima mssparkutils (disponibile solo su Fabric runtime)
-        from notebookutils import mssparkutils
-        val = mssparkutils.runtime.arguments.get(name)
-        if val:
-            return val
-    except Exception:
-        pass
-    # Fallback: variabile d'ambiente (utile nei test locali / DevOps pipeline)
+    # 1. Cerca in sys.argv nel formato --KEY value
+    key = f"--{name}"
+    for i, arg in enumerate(sys.argv):
+        if arg == key and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+
+    # 2. Fallback: variabile d'ambiente (utile nei test locali / DevOps pipeline)
     return os.environ.get(name, default)
 
 # Business Central
@@ -42,12 +42,19 @@ BC_CLIENT_SECRET = _get_param("BC_CLIENT_SECRET")
 
 ENVIRONMENT = _get_param("BC_ENVIRONMENT", "SandboxTest")
 
-# Multi-Company — passato come stringa JSON es: '["CRONUS%20IT","CRONUS%20USA"]'
-_companies_raw = _get_param("BC_COMPANIES", '["CRONUS%20IT"]')
+# Multi-Company — passato come Base64 di una stringa JSON es: '["CRONUS%20IT","CRONUS%20USA"]'
+def _decode_b64_param(name, default_json='[]'):
+    """Legge un parametro Base64-encoded e lo decodifica a stringa."""
+    raw = _get_param(name)
+    if raw:
+        return base64.b64decode(raw).decode('utf-8')
+    return default_json
+
+_companies_raw = _decode_b64_param("BC_COMPANIES_B64", '["CRONUS%20IT"]')
 COMPANIES = json.loads(_companies_raw)
 
-# Multi-Entity — passato come stringa JSON es: '["ItemLedgerEntries"]'
-_entities_raw = _get_param("BC_ENTITIES", '["ItemLedgerEntries"]')
+# Multi-Entity — passato come Base64 di una stringa JSON es: '["ItemLedgerEntries"]'
+_entities_raw = _decode_b64_param("BC_ENTITIES_B64", '["ItemLedgerEntries"]')
 ENTITIES = json.loads(_entities_raw)
 
 # OneLake
