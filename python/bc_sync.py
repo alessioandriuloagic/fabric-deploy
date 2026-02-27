@@ -28,10 +28,20 @@ def _get_param(name, default=None):
             return sys.argv[i + 1]
     return os.environ.get(name, default)
 
+def _get_param_b64(name, default=None):
+    """Legge un parametro codificato in Base64 e lo decodifica."""
+    raw = _get_param(name)
+    if raw:
+        try:
+            return base64.b64decode(raw).decode('utf-8')
+        except Exception:
+            return raw  # fallback: valore non codificato
+    return default
+
 # Business Central
 BC_TENANT_ID     = _get_param("BC_TENANT_ID")
 BC_CLIENT_ID     = _get_param("BC_CLIENT_ID")
-BC_CLIENT_SECRET = _get_param("BC_CLIENT_SECRET")
+BC_CLIENT_SECRET = _get_param_b64("BC_CLIENT_SECRET_B64") or _get_param("BC_CLIENT_SECRET")
 
 ENVIRONMENT = _get_param("BC_ENVIRONMENT", "SandboxTest")
 
@@ -58,7 +68,7 @@ KEYS_TARGET_FOLDER = "Files/MirroringKeys"
 # OneLake Service Principal
 ONELAKE_TENANT_ID     = _get_param("FABRIC_TENANT_ID",     BC_TENANT_ID)
 ONELAKE_CLIENT_ID     = _get_param("FABRIC_CLIENT_ID",     BC_CLIENT_ID)
-ONELAKE_CLIENT_SECRET = _get_param("FABRIC_CLIENT_SECRET", BC_CLIENT_SECRET)
+ONELAKE_CLIENT_SECRET = _get_param_b64("FABRIC_CLIENT_SECRET_B64") or _get_param("FABRIC_CLIENT_SECRET") or BC_CLIENT_SECRET
 
 # Validazione parametri obbligatori
 _required = {

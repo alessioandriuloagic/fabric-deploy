@@ -2,10 +2,17 @@
 # deploy.ps1 - Deploy modulare soluzione Fabric
 # Compatibile con PowerShell 5.1 (Windows runner DevOps)
 #
-# Supporta connettori multipli tramite flag:
-#   -Connectors "BC"       -> solo Business Central
-#   -Connectors "CRM"      -> solo Dataverse/CRM
-#   -Connectors "BC,CRM"   -> entrambi
+# Architettura:
+#   1 Lakehouse condiviso (LH_Bronze) con cartelle:
+#      Files/BC/Scripts/
+#      Files/CRM/Scripts/
+#      Files/Orchestration/
+#   1 Mirroring DB per connettore
+#   1 Spark Job per connettore
+#   1 Data Pipeline per connettore
+#
+# TUTTI i secret vengono codificati in Base64 nei
+# commandLineArguments per evitare caratteri vietati ($ `)
 # =============================================================
 param(
     [Parameter(Mandatory=$true)][string]$TenantId,
@@ -33,15 +40,15 @@ param(
     [string]$CrmPythonFile  = "crm_sync.py",
 
     # ── Nomi item Fabric ──
-    [string]$BcLakehouseName    = "LH_BC_Landing",
-    [string]$BcMirroringDbName  = "MirrorDB_BC_Landing",
-    [string]$BcSparkJobName     = "SJD_BC_To_Mirroring",
-    [string]$BcPipelineName     = "DP_BC_To_Mirroring",
+    [string]$LakehouseName      = "LH_Bronze",
 
-    [string]$CrmLakehouseName   = "LH_CRM_Landing",
-    [string]$CrmMirroringDbName = "MirrorDB_CRM_Landing",
-    [string]$CrmSparkJobName    = "SJD_CRM_To_Mirroring",
-    [string]$CrmPipelineName    = "DP_CRM_To_Mirroring",
+    [string]$BcMirroringDbName  = "MirrorDB_BC",
+    [string]$BcSparkJobName     = "SJD_BC_Sync",
+    [string]$BcPipelineName     = "DP_BC_Sync",
+
+    [string]$CrmMirroringDbName = "MirrorDB_CRM",
+    [string]$CrmSparkJobName    = "SJD_CRM_Sync",
+    [string]$CrmPipelineName    = "DP_CRM_Sync",
 
     [string]$PythonFileName = ""
 )
@@ -285,6 +292,31 @@ function Deploy-SparkJob {
     return [string]$sparkJobId
 }
 
+# Funzione per creare cartelle nel Lakehouse via OneLake DFS API
+function Ensure-LakehouseFolder {
+    param(
+        [string]$FolderPath,
+        [string]$Token
+    )
+    # OneLake DFS: PUT con ?resource=directory
+    $dfsUrl = "https://onelake.dfs.fabric.microsoft.com/$WorkspaceId/$lakehouseId/$FolderPath"
+    $dfsHeaders = @{
+        Authorization = "Bearer $Token"
+    }
+    try {
+        Invoke-WebRequest -Uri "$($dfsUrl)?resource=directory" -Method PUT -Headers $dfsHeaders -UseBasicParsing | Out-Null
+        Write-Host "  [OK] Cartella: $FolderPath"
+    } catch {
+        # 409 = gia esistente, OK
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        if ($statusCode -eq 409) {
+            Write-Host "  [OK] Cartella gia esistente: $FolderPath"
+        } else {
+            Write-Host "  [WARN] Impossibile creare cartella $FolderPath : $($_.Exception.Message)"
+        }
+    }
+}
+
 # ─────────────────────────────────────────
 # 0. AUTENTICAZIONE FABRIC
 # ─────────────────────────────────────────
@@ -305,7 +337,55 @@ $headers = @{
 $baseUrl = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
 Write-Host "[OK] Token Fabric ottenuto"
 
+# Token per OneLake DFS (scope storage)
+$onelakeTokenBody = @{
+    grant_type    = "client_credentials"
+    client_id     = $ClientId
+    client_secret = $ClientSecret
+    scope         = "https://storage.azure.com/.default"
+}
+$onelakeToken = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $onelakeTokenBody).access_token
+Write-Host "[OK] Token OneLake ottenuto"
+
 $deployedItems = @{}
+
+# ─────────────────────────────────────────
+# 1. LAKEHOUSE CONDIVISO (LH_Bronze)
+# ─────────────────────────────────────────
+Write-Host ""
+Write-Host "=== STEP 1: Lakehouse Condiviso ==="
+$lakehouseBody = @{
+    displayName = $LakehouseName
+    type        = "Lakehouse"
+    description = "Lakehouse Bronze - landing zone condivisa per tutti i connettori"
+} | ConvertTo-Json -Depth 5
+
+$lakehouseId = Get-OrCreate-Item `
+    -DisplayName $LakehouseName `
+    -Type        "Lakehouse" `
+    -CreateUrl   "$baseUrl/lakehouses" `
+    -ListUrl     "$baseUrl/lakehouses" `
+    -BodyJson    $lakehouseBody `
+    -Headers     $headers
+
+$lakehouseId = ([string]$lakehouseId).Trim()
+Write-Host "  Lakehouse ID: $lakehouseId"
+
+# Crea struttura cartelle
+Write-Host ""
+Write-Host "=== STEP 1b: Struttura Cartelle ==="
+$folders = @(
+    "Files/BC",
+    "Files/BC/Scripts",
+    "Files/CRM",
+    "Files/CRM/Scripts",
+    "Files/Orchestration",
+    "Files/MirroringState",
+    "Files/MirroringKeys"
+)
+foreach ($folder in $folders) {
+    Ensure-LakehouseFolder -FolderPath $folder -Token $onelakeToken
+}
 
 # =========================================================
 # DEPLOY BC CONNECTOR
@@ -316,88 +396,67 @@ if ($connectorList -contains "BC") {
     Write-Host "# DEPLOY CONNETTORE: BUSINESS CENTRAL"
     Write-Host "####################################################"
 
-    # -- STEP 1: Lakehouse BC --
-    Write-Host ""
-    Write-Host "=== BC STEP 1: Lakehouse ==="
-    $lakehouseBody = @{
-        displayName = $BcLakehouseName
-        type        = "Lakehouse"
-        description = "Lakehouse BC - contiene script Python e dati di staging"
-    } | ConvertTo-Json -Depth 5
-
-    $lakehouseId = Get-OrCreate-Item `
-        -DisplayName $BcLakehouseName `
-        -Type        "Lakehouse" `
-        -CreateUrl   "$baseUrl/lakehouses" `
-        -ListUrl     "$baseUrl/lakehouses" `
-        -BodyJson    $lakehouseBody `
-        -Headers     $headers
-    Write-Host "  Lakehouse ID: $lakehouseId"
-
-    # -- STEP 2: Mirroring DB BC --
+    # -- Mirroring DB BC --
     Write-Host ""
     Write-Host "=== BC STEP 2: Mirroring Database ==="
     $mirroringId = Get-OrCreate-MirroringDb `
         -DisplayName $BcMirroringDbName `
-        -Description "Open Mirroring Landing Zone - Business Central" `
+        -Description "Open Mirroring - Business Central" `
         -Headers     $headers `
         -BaseUrl     $baseUrl
 
-    # -- STEP 3: Spark Job BC --
+    # -- Spark Job BC --
     Write-Host ""
     Write-Host "=== BC STEP 3: Spark Job Definition ==="
     $sparkJobId = Deploy-SparkJob `
         -SparkJobName  $BcSparkJobName `
         -PythonFileName $BcPythonFile `
         -LakehouseId   $lakehouseId `
-        -Description   "Spark Job BC Sync - legge da BC e scrive su Mirroring Landing Zone" `
+        -Description   "Spark Job BC Sync" `
         -Headers       $headers `
         -BaseUrl       $baseUrl
 
-    # ─────────────────────────────────────────
-    # STEP 4: Data Pipeline BC
-    # Identico allo script originale: here-string
-    # inline con variabili nello scope corrente.
-    # ─────────────────────────────────────────
+    # ── STEP 4: Pipeline BC ──
+    # Here-string inline (pattern identico all'originale)
     Write-Host ""
     Write-Host "=== BC STEP 4: Data Pipeline ==="
 
-    # Sicurezza: forza ID a stringhe pulite (in caso di oggetti PS)
     $sparkJobId  = ([string]$sparkJobId).Trim()
-    $WorkspaceId = ([string]$WorkspaceId).Trim()
-    $lakehouseId = ([string]$lakehouseId).Trim()
     $mirroringId = ([string]$mirroringId).Trim()
 
     Write-Host "  Spark Job ID: $sparkJobId"
     Write-Host "  Workspace ID: $WorkspaceId"
     Write-Host "  Lakehouse ID: $lakehouseId"
+    Write-Host "  Mirroring ID: $mirroringId"
 
     if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
-        Write-Host "##[error] sparkJobId e' vuoto! Impossibile creare la pipeline."
+        Write-Host "##[error] sparkJobId BC e' vuoto!"
         exit 1
     }
 
-    $companiesB64 = To-Base64 $BcCompanies
-    $entitiesB64  = To-Base64 $BcEntities
+    # TUTTI i valori problematici in Base64 (evita $ e ` nei commandLineArguments)
+    $companiesB64     = To-Base64 $BcCompanies
+    $entitiesB64      = To-Base64 $BcEntities
+    $bcSecretB64      = To-Base64 $ClientSecret
+    $fabricSecretB64  = To-Base64 $ClientSecret
 
     $sparkArgs = @(
-        "--BC_TENANT_ID",         $BcTenantId,
-        "--BC_CLIENT_ID",         $ClientId,
-        "--BC_CLIENT_SECRET",     $ClientSecret,
-        "--BC_ENVIRONMENT",       $BcEnvironment,
-        "--BC_COMPANIES_B64",     $companiesB64,
-        "--BC_ENTITIES_B64",      $entitiesB64,
-        "--FABRIC_WORKSPACE_ID",  $WorkspaceId,
-        "--FABRIC_LAKEHOUSE_ID",  $lakehouseId,
-        "--FABRIC_MIRRORED_DB_ID", $mirroringId,
-        "--FABRIC_TENANT_ID",     $TenantId,
-        "--FABRIC_CLIENT_ID",     $ClientId,
-        "--FABRIC_CLIENT_SECRET", $ClientSecret
+        "--BC_TENANT_ID",            $BcTenantId,
+        "--BC_CLIENT_ID",            $ClientId,
+        "--BC_CLIENT_SECRET_B64",    $bcSecretB64,
+        "--BC_ENVIRONMENT",          $BcEnvironment,
+        "--BC_COMPANIES_B64",        $companiesB64,
+        "--BC_ENTITIES_B64",         $entitiesB64,
+        "--FABRIC_WORKSPACE_ID",     $WorkspaceId,
+        "--FABRIC_LAKEHOUSE_ID",     $lakehouseId,
+        "--FABRIC_MIRRORED_DB_ID",   $mirroringId,
+        "--FABRIC_TENANT_ID",        $TenantId,
+        "--FABRIC_CLIENT_ID",        $ClientId,
+        "--FABRIC_CLIENT_SECRET_B64", $fabricSecretB64
     ) -join " "
 
-    Write-Host "  commandLineArguments costruiti (companies/entities in Base64)"
+    Write-Host "  commandLineArguments costruiti (secrets + JSON in Base64)"
 
-    # Nomi locali per l'here-string (identici all'originale)
     $PipelineName = $BcPipelineName
     $SparkJobName = $BcSparkJobName
 
@@ -435,7 +494,6 @@ if ($connectorList -contains "BC") {
 
     Write-Host "  [DEBUG] Pipeline definition BC creata"
 
-    # Controlla se esiste gia
     $pipelineListUrl  = "$baseUrl/dataPipelines"
     $existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
                         | Where-Object { $_.displayName -eq $PipelineName }
@@ -465,7 +523,7 @@ if ($connectorList -contains "BC") {
 
         $pipelineBody = @{
             displayName = $PipelineName
-            description = "Pipeline BC - esegue Spark Job $SparkJobName"
+            description = "Pipeline BC Sync"
             definition  = @{
                 parts = @(@{
                     path        = "pipeline-content.json"
@@ -487,23 +545,15 @@ if ($connectorList -contains "BC") {
         Write-Host "  [OK] Creato - ID: $pipelineId"
     }
 
-    # Salva risultati BC
-    $bcLakehouseId_out = $lakehouseId
-    $bcMirroringId_out = $mirroringId
-    $bcSparkJobId_out  = $sparkJobId
-    $bcPipelineId_out  = $pipelineId
-
     $deployedItems["BC"] = @{
-        Lakehouse   = $bcLakehouseId_out
-        MirroringDb = $bcMirroringId_out
-        SparkJob    = $bcSparkJobId_out
-        Pipeline    = $bcPipelineId_out
+        MirroringDb = $mirroringId
+        SparkJob    = $sparkJobId
+        Pipeline    = $pipelineId
     }
 
-    Write-Host "##vso[task.setvariable variable=BC_LAKEHOUSE_ID]$bcLakehouseId_out"
-    Write-Host "##vso[task.setvariable variable=BC_MIRRORING_ID]$bcMirroringId_out"
-    Write-Host "##vso[task.setvariable variable=BC_SPARK_JOB_ID]$bcSparkJobId_out"
-    Write-Host "##vso[task.setvariable variable=BC_PIPELINE_ID]$bcPipelineId_out"
+    Write-Host "##vso[task.setvariable variable=BC_MIRRORING_ID]$mirroringId"
+    Write-Host "##vso[task.setvariable variable=BC_SPARK_JOB_ID]$sparkJobId"
+    Write-Host "##vso[task.setvariable variable=BC_PIPELINE_ID]$pipelineId"
 }
 
 # =========================================================
@@ -515,86 +565,64 @@ if ($connectorList -contains "CRM") {
     Write-Host "# DEPLOY CONNETTORE: CRM / DATAVERSE"
     Write-Host "####################################################"
 
-    # -- STEP 1: Lakehouse CRM --
-    Write-Host ""
-    Write-Host "=== CRM STEP 1: Lakehouse ==="
-    $lakehouseBody = @{
-        displayName = $CrmLakehouseName
-        type        = "Lakehouse"
-        description = "Lakehouse CRM - contiene script Python e dati Dataverse"
-    } | ConvertTo-Json -Depth 5
-
-    $lakehouseId = Get-OrCreate-Item `
-        -DisplayName $CrmLakehouseName `
-        -Type        "Lakehouse" `
-        -CreateUrl   "$baseUrl/lakehouses" `
-        -ListUrl     "$baseUrl/lakehouses" `
-        -BodyJson    $lakehouseBody `
-        -Headers     $headers
-    Write-Host "  Lakehouse ID: $lakehouseId"
-
-    # -- STEP 2: Mirroring DB CRM --
+    # -- Mirroring DB CRM --
     Write-Host ""
     Write-Host "=== CRM STEP 2: Mirroring Database ==="
     $mirroringId = Get-OrCreate-MirroringDb `
         -DisplayName $CrmMirroringDbName `
-        -Description "Open Mirroring Landing Zone - CRM / Dataverse" `
+        -Description "Open Mirroring - CRM / Dataverse" `
         -Headers     $headers `
         -BaseUrl     $baseUrl
 
-    # -- STEP 3: Spark Job CRM --
+    # -- Spark Job CRM --
     Write-Host ""
     Write-Host "=== CRM STEP 3: Spark Job Definition ==="
     $sparkJobId = Deploy-SparkJob `
         -SparkJobName  $CrmSparkJobName `
         -PythonFileName $CrmPythonFile `
         -LakehouseId   $lakehouseId `
-        -Description   "Spark Job CRM Sync - legge da Dataverse e scrive su Mirroring Landing Zone" `
+        -Description   "Spark Job CRM Sync" `
         -Headers       $headers `
         -BaseUrl       $baseUrl
 
-    # ─────────────────────────────────────────
-    # STEP 4: Data Pipeline CRM
-    # Identico pattern dell'originale.
-    # ─────────────────────────────────────────
+    # ── STEP 4: Pipeline CRM ──
     Write-Host ""
     Write-Host "=== CRM STEP 4: Data Pipeline ==="
 
-    # Sicurezza: forza ID a stringhe pulite
     $sparkJobId  = ([string]$sparkJobId).Trim()
-    $WorkspaceId = ([string]$WorkspaceId).Trim()
-    $lakehouseId = ([string]$lakehouseId).Trim()
     $mirroringId = ([string]$mirroringId).Trim()
 
     Write-Host "  Spark Job ID: $sparkJobId"
     Write-Host "  Workspace ID: $WorkspaceId"
     Write-Host "  Lakehouse ID: $lakehouseId"
+    Write-Host "  Mirroring ID: $mirroringId"
 
     if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
-        Write-Host "##[error] sparkJobId e' vuoto! Impossibile creare la pipeline CRM."
+        Write-Host "##[error] sparkJobId CRM e' vuoto!"
         exit 1
     }
 
-    $crmEntitiesB64 = To-Base64 $CrmEntities
+    $crmEntitiesB64    = To-Base64 $CrmEntities
+    $crmSecretB64      = To-Base64 $CrmClientSecret
+    $fabricSecretB64   = To-Base64 $ClientSecret
 
     $sparkArgs = @(
-        "--CRM_TENANT_ID",        $CrmTenantId,
-        "--CRM_CLIENT_ID",        $CrmClientId,
-        "--CRM_CLIENT_SECRET",    $CrmClientSecret,
-        "--CRM_ORG_URL",          $CrmOrgUrl,
-        "--CRM_API_VERSION",      $CrmApiVersion,
-        "--CRM_ENTITIES_B64",     $crmEntitiesB64,
-        "--FABRIC_WORKSPACE_ID",  $WorkspaceId,
-        "--FABRIC_LAKEHOUSE_ID",  $lakehouseId,
-        "--FABRIC_MIRRORED_DB_ID", $mirroringId,
-        "--FABRIC_TENANT_ID",     $TenantId,
-        "--FABRIC_CLIENT_ID",     $ClientId,
-        "--FABRIC_CLIENT_SECRET", $ClientSecret
+        "--CRM_TENANT_ID",             $CrmTenantId,
+        "--CRM_CLIENT_ID",             $CrmClientId,
+        "--CRM_CLIENT_SECRET_B64",     $crmSecretB64,
+        "--CRM_ORG_URL",               $CrmOrgUrl,
+        "--CRM_API_VERSION",           $CrmApiVersion,
+        "--CRM_ENTITIES_B64",          $crmEntitiesB64,
+        "--FABRIC_WORKSPACE_ID",       $WorkspaceId,
+        "--FABRIC_LAKEHOUSE_ID",       $lakehouseId,
+        "--FABRIC_MIRRORED_DB_ID",     $mirroringId,
+        "--FABRIC_TENANT_ID",          $TenantId,
+        "--FABRIC_CLIENT_ID",          $ClientId,
+        "--FABRIC_CLIENT_SECRET_B64",  $fabricSecretB64
     ) -join " "
 
-    Write-Host "  commandLineArguments costruiti (entities in Base64)"
+    Write-Host "  commandLineArguments costruiti (secrets + JSON in Base64)"
 
-    # Nomi locali per l'here-string
     $PipelineName = $CrmPipelineName
     $SparkJobName = $CrmSparkJobName
 
@@ -632,7 +660,6 @@ if ($connectorList -contains "CRM") {
 
     Write-Host "  [DEBUG] Pipeline definition CRM creata"
 
-    # Controlla se esiste gia
     $pipelineListUrl  = "$baseUrl/dataPipelines"
     $existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
                         | Where-Object { $_.displayName -eq $PipelineName }
@@ -662,7 +689,7 @@ if ($connectorList -contains "CRM") {
 
         $pipelineBody = @{
             displayName = $PipelineName
-            description = "Pipeline CRM - esegue Spark Job $SparkJobName"
+            description = "Pipeline CRM Sync"
             definition  = @{
                 parts = @(@{
                     path        = "pipeline-content.json"
@@ -684,23 +711,15 @@ if ($connectorList -contains "CRM") {
         Write-Host "  [OK] Creato - ID: $pipelineId"
     }
 
-    # Salva risultati CRM
-    $crmLakehouseId_out = $lakehouseId
-    $crmMirroringId_out = $mirroringId
-    $crmSparkJobId_out  = $sparkJobId
-    $crmPipelineId_out  = $pipelineId
-
     $deployedItems["CRM"] = @{
-        Lakehouse   = $crmLakehouseId_out
-        MirroringDb = $crmMirroringId_out
-        SparkJob    = $crmSparkJobId_out
-        Pipeline    = $crmPipelineId_out
+        MirroringDb = $mirroringId
+        SparkJob    = $sparkJobId
+        Pipeline    = $pipelineId
     }
 
-    Write-Host "##vso[task.setvariable variable=CRM_LAKEHOUSE_ID]$crmLakehouseId_out"
-    Write-Host "##vso[task.setvariable variable=CRM_MIRRORING_ID]$crmMirroringId_out"
-    Write-Host "##vso[task.setvariable variable=CRM_SPARK_JOB_ID]$crmSparkJobId_out"
-    Write-Host "##vso[task.setvariable variable=CRM_PIPELINE_ID]$crmPipelineId_out"
+    Write-Host "##vso[task.setvariable variable=CRM_MIRRORING_ID]$mirroringId"
+    Write-Host "##vso[task.setvariable variable=CRM_SPARK_JOB_ID]$sparkJobId"
+    Write-Host "##vso[task.setvariable variable=CRM_PIPELINE_ID]$pipelineId"
 }
 
 # ─────────────────────────────────────────
@@ -710,17 +729,27 @@ Write-Host ""
 Write-Host "============================================"
 Write-Host "[OK] DEPLOY COMPLETATO"
 Write-Host "============================================"
-Write-Host "  Connettori deployati: $($connectorList -join ', ')"
+Write-Host "  Connettori: $($connectorList -join ', ')"
+Write-Host "  Lakehouse : $lakehouseId ($LakehouseName)"
 Write-Host ""
 
 foreach ($conn in $deployedItems.Keys) {
     $items = $deployedItems[$conn]
     Write-Host "  --- $conn ---"
-    Write-Host "    Lakehouse         : $($items.Lakehouse)"
     Write-Host "    Mirroring Database: $($items.MirroringDb)"
     Write-Host "    Spark Job         : $($items.SparkJob)"
     Write-Host "    Data Pipeline     : $($items.Pipeline)"
     Write-Host ""
 }
 
+Write-Host "  Struttura Lakehouse:"
+Write-Host "    $LakehouseName/"
+Write-Host "      Files/"
+Write-Host "        BC/Scripts/"
+Write-Host "        CRM/Scripts/"
+Write-Host "        Orchestration/"
+Write-Host "        MirroringState/"
+Write-Host "        MirroringKeys/"
 Write-Host "============================================"
+
+Write-Host "##vso[task.setvariable variable=LAKEHOUSE_ID]$lakehouseId"

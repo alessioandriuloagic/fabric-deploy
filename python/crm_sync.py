@@ -28,10 +28,20 @@ def _get_param(name, default=None):
             return sys.argv[i + 1]
     return os.environ.get(name, default)
 
+def _get_param_b64(name, default=None):
+    """Legge un parametro codificato in Base64 e lo decodifica."""
+    raw = _get_param(name)
+    if raw:
+        try:
+            return base64.b64decode(raw).decode('utf-8')
+        except Exception:
+            return raw  # fallback: valore non codificato
+    return default
+
 # Dataverse / CRM
 CRM_TENANT_ID     = _get_param("CRM_TENANT_ID")
 CRM_CLIENT_ID     = _get_param("CRM_CLIENT_ID")
-CRM_CLIENT_SECRET = _get_param("CRM_CLIENT_SECRET")
+CRM_CLIENT_SECRET = _get_param_b64("CRM_CLIENT_SECRET_B64") or _get_param("CRM_CLIENT_SECRET")
 
 # URL dell'organizzazione Dataverse (es: https://orgname.crm4.dynamics.com)
 CRM_ORG_URL       = _get_param("CRM_ORG_URL", "").rstrip("/")
@@ -60,7 +70,7 @@ KEYS_TARGET_FOLDER = "Files/MirroringKeys"
 # OneLake Service Principal (default: stessi del CRM)
 ONELAKE_TENANT_ID     = _get_param("FABRIC_TENANT_ID",     CRM_TENANT_ID)
 ONELAKE_CLIENT_ID     = _get_param("FABRIC_CLIENT_ID",     CRM_CLIENT_ID)
-ONELAKE_CLIENT_SECRET = _get_param("FABRIC_CLIENT_SECRET", CRM_CLIENT_SECRET)
+ONELAKE_CLIENT_SECRET = _get_param_b64("FABRIC_CLIENT_SECRET_B64") or _get_param("FABRIC_CLIENT_SECRET") or CRM_CLIENT_SECRET
 
 # Validazione parametri obbligatori
 _required = {
@@ -149,10 +159,6 @@ def update_file_sequence(entity, sequence):
 # ================= DATA HELPERS =================
 
 def add_row_marker_column(df, mode=None, is_incremental=None, key_columns=None, keep_data_for_delete=False):
-    """
-    Aggiunge la colonna __rowMarker__ per Open Mirroring.
-    0=Insert, 1=Update, 2=Delete, 4=Upsert
-    """
     mapper = {'insert': 0, 'update': 1, 'delete': 2, 'upsert': 4}
 
     if mode is None:
@@ -249,7 +255,6 @@ def save_current_keys(df_keys, entity):
 
 def create_openmirroring_metadata(df, key_columns=None):
     if key_columns is None:
-        # Dataverse usa tipicamente <entityname>id come PK (es: accountid, contactid)
         id_cols = [c for c in df.columns if c.lower().endswith('id') and 'odata' not in c.lower()]
         if id_cols:
             key_columns = [id_cols[0]]
@@ -301,25 +306,16 @@ def create_partner_events(entity):
 # ================= CRM / DATAVERSE API =================
 
 def get_crm_token():
-    """
-    Ottiene un token OAuth2 per Dataverse Web API usando client_credentials.
-    Lo scope per Dataverse è: https://<orgurl>/.default
-    """
     credential = ClientSecretCredential(
         tenant_id=CRM_TENANT_ID,
         client_id=CRM_CLIENT_ID,
         client_secret=CRM_CLIENT_SECRET
     )
-    # Lo scope per Dataverse: l'URL dell'organizzazione + /.default
     scope = f"{CRM_ORG_URL}/.default"
     token = credential.get_token(scope)
     return token.token
 
 def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_keys=None, key_columns=None, keep_data_for_delete=False):
-    """
-    Estrae dati da Dataverse Web API con paginazione e filtro incrementale.
-    URL formato: https://orgname.crm4.dynamics.com/api/data/v9.2/<entityset>
-    """
     base_url = f"{CRM_ORG_URL}/api/data/{CRM_API_VERSION}/{entity}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -357,7 +353,6 @@ def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_key
                 filter_date = str(last_load_timestamp)
                 if not filter_date.endswith('Z'):
                     filter_date = filter_date.rstrip() + "Z"
-            # Dataverse usa modifiedon come campo di audit standard
             filter_query = f"?$filter=modifiedon gt {filter_date}"
             url_with_filter = base_url + filter_query
             print(f"  [INCREMENTAL] modifiedon > {filter_date}")
@@ -378,7 +373,6 @@ def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_key
                     pagination_url = url_with_filter = base_url
                     continue
 
-                # Gestione rate limiting (429)
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", 30))
                     print(f"  [THROTTLE] Rate limited. Attesa {retry_after}s...")
@@ -394,7 +388,6 @@ def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_key
                 if page_count % 10 == 0:
                     print(f"  [PAGING] Pagina {page_count}, {len(rows)} righe totali...")
 
-                # Dataverse usa @odata.nextLink per la paginazione
                 pagination_url = data.get("@odata.nextLink")
 
             except Exception as e:
@@ -414,13 +407,10 @@ def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_key
 
     df = pd.DataFrame(rows)
 
-    # Rimuovi colonne OData di sistema
     odata_cols = [col for col in df.columns if col.startswith('@')]
     if odata_cols:
         df = df.drop(columns=odata_cols)
 
-    # Rimuovi colonne di navigazione (_xyz_value che sono lookup ID)
-    # Le manteniamo perché sono utili come FK, ma rimuoviamo quelle @odata
     nav_annotation_cols = [col for col in df.columns if '@' in col]
     if nav_annotation_cols:
         df = df.drop(columns=nav_annotation_cols)
@@ -474,20 +464,16 @@ def upload_to_onelake(df, entity, metadata_override=None):
             client = _get_onelake_client().get_file_system_client(WORKSPACE_ID)
             table_folder = f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/{table_name}"
 
-            # 1. CSV
             csv_bytes = df.to_csv(index=False, encoding='utf-8', quoting=1, lineterminator='\r\n').encode('utf-8')
             client.get_file_client(f"{table_folder}/{data_file_name}").upload_data(csv_bytes, overwrite=True)
 
-            # 2. _metadata.json
             metadata = metadata_override if metadata_override else create_openmirroring_metadata(df)
             metadata_bytes = json.dumps(metadata, indent=2).encode('utf-8')
             client.get_file_client(f"{table_folder}/_metadata.json").upload_data(metadata_bytes, overwrite=True)
 
-            # 3. _partnerEvents.json
             pe_bytes = json.dumps(create_partner_events(entity), indent=2).encode('utf-8')
             client.get_file_client(f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/_partnerEvents.json").upload_data(pe_bytes, overwrite=True)
 
-            # 4. Aggiorna stato
             update_file_sequence(entity, next_sequence)
             update_load_timestamp(entity, datetime.now())
 
@@ -550,7 +536,6 @@ if __name__ == "__main__":
 
                 current_keys_df = df.loc[:, key_columns].drop_duplicates().astype(str).reset_index(drop=True)
 
-                # Rileva delete
                 prev_keys_df = load_previous_keys(entity)
                 if prev_keys_df is not None:
                     prev = prev_keys_df.astype(str)
@@ -562,12 +547,9 @@ if __name__ == "__main__":
                         metadata_delete = create_openmirroring_metadata(deleted_keys_df, key_columns=key_columns)
                         upload_to_onelake(delete_df, entity, metadata_override=metadata_delete)
 
-                # Upload dati
                 upload_to_onelake(df, entity)
-
                 total_uploaded += 1
 
-                # Salva chiavi per prossimo run
                 try:
                     save_current_keys(current_keys_df, entity)
                 except Exception as e:

@@ -1,7 +1,7 @@
 # =============================================================
 # azure-pipelines.yml
-# Pipeline di release modulare per deploy soluzione Fabric
-# Supporta connettori: BC, CRM, o entrambi
+# Pipeline di release modulare - Fabric Data Integration
+# 1 Lakehouse condiviso (LH_Bronze) + connettori selezionabili
 # =============================================================
 trigger: none
 
@@ -15,7 +15,7 @@ parameters:
       - prod
 
   - name: connectors
-    displayName: "Connettori da installare (separati da virgola)"
+    displayName: "Connettori da installare"
     type: string
     default: "BC"
     values:
@@ -38,7 +38,6 @@ stages:
         steps:
           - checkout: self
 
-          # -- Verifica variabili obbligatorie --
           - task: PowerShell@2
             displayName: "Verifica variabili"
             inputs:
@@ -47,17 +46,14 @@ stages:
                 $connectors = "${{ parameters.connectors }}".Split(",") | ForEach-Object { $_.Trim().ToUpper() }
                 Write-Host "[CONFIG] Connettori: $($connectors -join ', ')"
 
-                # Variabili sempre obbligatorie (Fabric)
                 $required = @(
                   "FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID"
                 )
 
-                # Variabili obbligatorie per BC
                 if ($connectors -contains "BC") {
                   $required += @("BC_TENANT_ID","BC_ENVIRONMENT","BC_COMPANIES","BC_ENTITIES")
                 }
 
-                # Variabili obbligatorie per CRM
                 if ($connectors -contains "CRM") {
                   $required += @("CRM_ORG_URL","CRM_ENTITIES")
                 }
@@ -92,7 +88,6 @@ stages:
               CRM_CLIENT_ID:        $(CRM_CLIENT_ID)
               CRM_CLIENT_SECRET:    $(CRM_CLIENT_SECRET)
 
-          # -- Deploy tutti gli item Fabric --
           - task: PowerShell@2
             displayName: "Deploy Fabric items"
             inputs:
