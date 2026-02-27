@@ -1,89 +1,144 @@
-# fabric-deploy
+# Fabric Data Integration - Modular Connector Architecture
 
-Deploy automatico di una soluzione Microsoft Fabric via Azure DevOps.
+## Architettura
 
-## Struttura repo
+La soluzione supporta **connettori multipli**, ognuno indipendente con i propri item Fabric:
 
 ```
-fabric-deploy/
-├── python/
-│   └── bc_sync.py                  ← Script Python (Spark Job)
+Repository
+├── azure-pipelines.yml          # Pipeline DevOps con parametro Connectors
 ├── scripts/
-│   └── deploy.ps1                  ← Script di deploy PowerShell
-├── azure-pipelines.yml             ← Pipeline Azure DevOps
-└── README.md
+│   └── deploy.ps1               # Deploy modulare (flag -Connectors "BC,CRM")
+└── python/
+    ├── bc_sync.py               # Connettore Business Central (esistente)
+    └── crm_sync.py              # Connettore CRM / Dataverse (nuovo)
 ```
 
-## Cosa viene deployato
+Ogni connettore crea un set isolato di item Fabric:
 
-Il deploy crea nell'ordine:
-
-1. **File Python** → caricato su `Files/Scripts/bc_sync.py` nel Lakehouse
-2. **Mirrored Database** (Open Mirroring) → Landing Zone per i CSV da BC
-3. **Spark Job Definition** → punta al file Python nel Lakehouse
-4. **Data Pipeline** → esegue lo Spark Job
-
----
-
-## Setup iniziale (una tantum)
-
-### 1. Variable Group in Azure DevOps Library
-
-Vai su **Pipelines → Library → + Variable group** e crea un gruppo chiamato `fabric-deploy-dev`.
-
-Aggiungi queste variabili (quelle con 🔒 impostale come Secret):
-
-| Variabile               | Esempio                                | Secret |
-|-------------------------|----------------------------------------|--------|
-| `FABRIC_TENANT_ID`      | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |        |
-| `FABRIC_CLIENT_ID`      | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |        |
-| `FABRIC_CLIENT_SECRET`  | `your-secret-here`                     | 🔒     |
-| `FABRIC_WORKSPACE_ID`   | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |        |
-| `FABRIC_LAKEHOUSE_ID`   | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |        |
-| `PYTHON_FILE_NAME`      | `bc_sync.py`                           |        |
-
-Per ogni cliente/ambiente aggiuntivo crea un gruppo separato: `fabric-deploy-prod`, `fabric-deploy-clienteA`, ecc.
-
-### 2. Permessi Service Principal su Fabric
-
-Nel Fabric Portal:
-- Vai nel workspace → **Manage access**
-- Aggiungi il Service Principal come **Member** o **Admin**
-
-In Fabric Admin Portal (solo se non già fatto):
-- Vai su **Admin Portal → Tenant settings**
-- Abilita **"Service principals can use Fabric APIs"**
-
-### 3. Collega la pipeline DevOps
-
-- Vai su **Pipelines → New pipeline**
-- Seleziona il repo e punta al file `azure-pipelines.yml`
-- Autorizza l'accesso al Variable Group quando richiesto
+| Item | BC | CRM |
+|------|------|------|
+| Lakehouse | `LH_BC_Landing` | `LH_CRM_Landing` |
+| Mirroring DB | `MirrorDB_BC_Landing` | `MirrorDB_CRM_Landing` |
+| Spark Job | `SJD_BC_To_Mirroring` | `SJD_CRM_To_Mirroring` |
+| Pipeline | `DP_BC_To_Mirroring` | `DP_CRM_To_Mirroring` |
 
 ---
 
-## Come fare il deploy
+## Come funziona il flag Connectors
 
-1. Vai su **Pipelines** in Azure DevOps
-2. Seleziona la pipeline `fabric-deploy`
-3. Clicca **Run pipeline**
-4. Seleziona il parametro `targetEnvironment` (es. `dev`)
-5. Clicca **Run**
+Nella pipeline DevOps si seleziona quale connettore installare:
 
-Il deploy dura circa 1-2 minuti. Al termine trovi nel log i 3 ID creati.
+- **`BC`** → installa solo Business Central
+- **`CRM`** → installa solo CRM/Dataverse
+- **`BC,CRM`** → installa entrambi
 
----
-
-## Idempotenza
-
-Lo script è idempotente: se un item esiste già (stesso `displayName`) non lo ricrea,
-lo lascia invariato. Puoi rilanciarla pipeline più volte senza problemi.
+Il deploy crea solo gli item necessari per i connettori selezionati.
 
 ---
 
-## Aggiungere un nuovo cliente
+## Setup per nuovo cliente
 
-1. Crea un nuovo Variable Group: `fabric-deploy-clienteX`
-2. Inserisci i valori specifici del workspace del cliente
-3. Aggiungi `clienteX` alla lista `values` in `azure-pipelines.yml`
-4. Lancia la pipeline selezionando `clienteX`
+### 1. Variable Group in Azure DevOps
+
+Creare il Variable Group `fabric-deploy-<env>` (es: `fabric-deploy-prod`) con:
+
+**Sempre obbligatorie (Fabric):**
+| Variabile | Descrizione |
+|-----------|-------------|
+| `FABRIC_TENANT_ID` | Tenant ID Azure del cliente |
+| `FABRIC_CLIENT_ID` | Client ID Service Principal Fabric |
+| `FABRIC_CLIENT_SECRET` | Client Secret (secret!) |
+| `FABRIC_WORKSPACE_ID` | ID Workspace Fabric target |
+
+**Se connettore BC:**
+| Variabile | Descrizione |
+|-----------|-------------|
+| `BC_TENANT_ID` | Tenant ID per Business Central |
+| `BC_ENVIRONMENT` | Nome ambiente BC (es: `Production`) |
+| `BC_COMPANIES` | JSON array aziende (es: `["CRONUS%20IT"]`) |
+| `BC_ENTITIES` | JSON array entità (es: `["ItemLedgerEntries","Customers"]`) |
+
+**Se connettore CRM:**
+| Variabile | Descrizione |
+|-----------|-------------|
+| `CRM_ORG_URL` | URL organizzazione Dataverse (es: `https://contoso.crm4.dynamics.com`) |
+| `CRM_ENTITIES` | JSON array entity set (es: `["accounts","contacts","opportunities"]`) |
+| `CRM_TENANT_ID` | *(opzionale)* Tenant CRM, default = FABRIC_TENANT_ID |
+| `CRM_CLIENT_ID` | *(opzionale)* Client ID CRM, default = FABRIC_CLIENT_ID |
+| `CRM_CLIENT_SECRET` | *(opzionale)* Secret CRM, default = FABRIC_CLIENT_SECRET |
+| `CRM_API_VERSION` | *(opzionale)* Versione Web API, default = `v9.2` |
+
+### 2. Azure AD App Registration per CRM
+
+Il Service Principal deve avere permessi su Dataverse:
+
+1. In **Azure Portal → App Registrations** → la tua app
+2. **API Permissions → Add → Dynamics CRM → user_impersonation** (o Application permission)
+3. In **Power Platform Admin Center → Environment → Settings → Users**:
+   - Aggiungere l'app come Application User
+   - Assegnare un Security Role con permessi di lettura sulle entità desiderate
+
+### 3. Trovare l'URL dell'organizzazione CRM
+
+L'URL ha il formato: `https://<orgname>.crm<N>.dynamics.com`
+
+Per trovarlo:
+- **Power Platform Admin Center** → Environments → seleziona ambiente → copia l'URL
+- Oppure: Dynamics 365 → Settings → Customizations → Developer Resources → Web API URL
+
+**Nota:** il suffisso `crmN` dipende dalla region:
+- `crm.dynamics.com` = Nord America
+- `crm4.dynamics.com` = EMEA
+- `crm5.dynamics.com` = Asia Pacific
+- ecc.
+
+### 4. Entity Set Names per CRM
+
+I nomi EntitySet in Dataverse sono tipicamente il **nome logico plurale** della tabella:
+
+| Tabella | EntitySet |
+|---------|-----------|
+| Account | `accounts` |
+| Contact | `contacts` |
+| Opportunity | `opportunities` |
+| Lead | `leads` |
+| Case/Incident | `incidents` |
+| Quote | `quotes` |
+| Order | `salesorders` |
+| Invoice | `invoices` |
+| Custom: `new_myentity` | `new_myentities` |
+
+Per verificare: `GET https://<orgurl>/api/data/v9.2/` elenca tutti gli EntitySet disponibili.
+
+---
+
+## Esecuzione Pipeline DevOps
+
+```
+# Solo BC
+az pipelines run --name "fabric-deploy" --parameters connectors=BC targetEnvironment=prod
+
+# Solo CRM
+az pipelines run --name "fabric-deploy" --parameters connectors=CRM targetEnvironment=prod
+
+# Entrambi
+az pipelines run --name "fabric-deploy" --parameters connectors=BC,CRM targetEnvironment=prod
+```
+
+Oppure tramite UI DevOps selezionando i parametri.
+
+---
+
+## Differenze chiave BC vs CRM
+
+| Aspetto | BC | CRM / Dataverse |
+|---------|----|----|
+| **API** | ODataV4 via BC API | Web API v9.2 (OData v4) |
+| **Auth scope** | `https://api.businesscentral.dynamics.com/.default` | `https://<orgurl>/.default` |
+| **URL base** | `https://api.businesscentral.dynamics.com/v2.0/{tenant}/{env}/ODataV4/Company('{co}')/{entity}` | `https://<orgurl>/api/data/v9.2/{entityset}` |
+| **Filtro incrementale** | `SystemModifiedAt gt datetime'...'` | `modifiedon gt ...` |
+| **Paginazione** | `@odata.nextLink` | `@odata.nextLink` (max 5000/page) |
+| **Rate limiting** | Standard HTTP retry | 429 con `Retry-After` header |
+| **Chiave primaria** | Tipicamente `id` | Tipicamente `<entity>id` (es: `accountid`) |
+| **Multi-company** | Sì (loop su companies) | No (1 org = 1 ambiente) |
