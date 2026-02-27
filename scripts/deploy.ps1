@@ -294,6 +294,7 @@ Write-Host "  Lakehouse ID: $lakehouseId"
 $sparkJobId  = [string]$sparkJobId
 $WorkspaceId = [string]$WorkspaceId
 $lakehouseId = [string]$lakehouseId
+$mirroringId = [string]$mirroringId
 
 if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
     Write-Host "##[error] sparkJobId e' vuoto! Impossibile creare la pipeline."
@@ -307,16 +308,17 @@ $companiesB64 = To-Base64 $BcCompanies
 $entitiesB64  = To-Base64 $BcEntities
 
 $sparkArgs = @(
-    "--BC_TENANT_ID",        $BcTenantId,
-    "--BC_CLIENT_ID",        $ClientId,
-    "--BC_CLIENT_SECRET",    $ClientSecret,
-    "--BC_ENVIRONMENT",      $BcEnvironment,
-    "--BC_COMPANIES_B64",    $companiesB64,
-    "--BC_ENTITIES_B64",     $entitiesB64,
-    "--FABRIC_WORKSPACE_ID", $WorkspaceId,
-    "--FABRIC_LAKEHOUSE_ID", $lakehouseId,
-    "--FABRIC_TENANT_ID",    $TenantId,
-    "--FABRIC_CLIENT_ID",    $ClientId,
+    "--BC_TENANT_ID",         $BcTenantId,
+    "--BC_CLIENT_ID",         $ClientId,
+    "--BC_CLIENT_SECRET",     $ClientSecret,
+    "--BC_ENVIRONMENT",       $BcEnvironment,
+    "--BC_COMPANIES_B64",     $companiesB64,
+    "--BC_ENTITIES_B64",      $entitiesB64,
+    "--FABRIC_WORKSPACE_ID",  $WorkspaceId,
+    "--FABRIC_LAKEHOUSE_ID",  $lakehouseId,
+    "--FABRIC_MIRRORED_DB_ID", $mirroringId,
+    "--FABRIC_TENANT_ID",     $TenantId,
+    "--FABRIC_CLIENT_ID",     $ClientId,
     "--FABRIC_CLIENT_SECRET", $ClientSecret
 ) -join " "
 

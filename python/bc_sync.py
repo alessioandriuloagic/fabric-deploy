@@ -60,7 +60,10 @@ ENTITIES = json.loads(_entities_raw)
 # OneLake
 WORKSPACE_ID      = _get_param("FABRIC_WORKSPACE_ID")
 LAKEHOUSE_ID      = _get_param("FABRIC_LAKEHOUSE_ID")
-TARGET_FOLDER     = "Files/LandingZone"
+MIRRORED_DB_ID    = _get_param("FABRIC_MIRRORED_DB_ID")
+
+# Target: la Landing Zone è sul Mirrored Database, NON sul Lakehouse
+TARGET_FOLDER      = "Files/LandingZone"
 KEYS_TARGET_FOLDER = "Files/MirroringKeys"
 
 # OneLake Service Principal (stessa App Registration usata per Fabric e BC)
@@ -75,6 +78,7 @@ _required = {
     "BC_CLIENT_SECRET": BC_CLIENT_SECRET,
     "FABRIC_WORKSPACE_ID": WORKSPACE_ID,
     "FABRIC_LAKEHOUSE_ID": LAKEHOUSE_ID,
+    "FABRIC_MIRRORED_DB_ID": MIRRORED_DB_ID,
 }
 _missing = [k for k, v in _required.items() if not v]
 if _missing:
@@ -294,7 +298,7 @@ def sanitize_dataframe(df):
 
 
 def _keys_file_path(company, entity):
-    # Path su OneLake per le chiavi
+    # Path su OneLake per le chiavi (sul Lakehouse, non sul Mirrored DB)
     safe_company = re.sub(r'[^a-zA-Z0-9_-]', '_', company)
     safe_entity = re.sub(r'[^a-zA-Z0-9_-]', '_', entity)
     return f"{LAKEHOUSE_ID}/{KEYS_TARGET_FOLDER}/{safe_company}/{safe_entity}/keys.csv"
@@ -661,7 +665,7 @@ def upload_to_onelake(df, company, entity, metadata_override=None):
 
             service_client     = _get_onelake_client()
             file_system_client = service_client.get_file_system_client(WORKSPACE_ID)
-            table_folder       = f"{LAKEHOUSE_ID}/{TARGET_FOLDER}/{table_name}"
+            table_folder       = f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/{table_name}"
 
             # 1. Upload CSV
             csv_bytes      = df.to_csv(index=False, encoding='utf-8', quoting=1, lineterminator='\r\n').encode('utf-8')
@@ -682,7 +686,7 @@ def upload_to_onelake(df, company, entity, metadata_override=None):
             # 3. Upload _partnerEvents.json (livello database)
             partner_events       = create_partner_events(company, entity)
             partner_events_bytes = json.dumps(partner_events, indent=2).encode('utf-8')
-            partner_events_path  = f"{LAKEHOUSE_ID}/{TARGET_FOLDER}/_partnerEvents.json"
+            partner_events_path  = f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/_partnerEvents.json"
             print(f"  ℹ️  Upload _partnerEvents.json")
             file_client = file_system_client.get_file_client(partner_events_path)
             file_client.upload_data(partner_events_bytes, overwrite=True)
