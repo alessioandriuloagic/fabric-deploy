@@ -2,15 +2,9 @@
 # deploy.ps1 - Deploy modulare soluzione Fabric
 # Compatibile con PowerShell 5.1 (Windows runner DevOps)
 #
-# Architettura:
-#   1 Lakehouse condiviso (LH_Bronze) con cartelle organizzate
-#   1 Mirroring DB per connettore
-#   1 Spark Job per connettore
-#   1 Data Pipeline per connettore
-#
-# TUTTI i secret e JSON vengono codificati in Base64 nei
-# commandLineArguments. La pipeline definition viene costruita
-# con ConvertTo-Json (non here-string) per evitare $ e `.
+# TUTTI i secret codificati Base64. Pipeline JSON con ConvertTo-Json.
+# Validazione anti-$(VAR) per variabili DevOps non risolte.
+# -ForceRecreate: elimina e ricrea pipeline (fix cached definitions)
 # =============================================================
 param(
     [Parameter(Mandatory=$true)][string]$TenantId,
@@ -19,15 +13,14 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkspaceId,
 
     [string]$Connectors = "BC",
+    [switch]$ForceRecreate,
 
-    # ── Parametri BC ──
     [string]$BcTenantId     = "",
     [string]$BcEnvironment  = "SandboxTest",
     [string]$BcCompanies    = '["CRONUS%20IT"]',
     [string]$BcEntities     = '["ItemLedgerEntries"]',
     [string]$BcPythonFile   = "bc_sync.py",
 
-    # ── Parametri CRM ──
     [string]$CrmTenantId    = "",
     [string]$CrmClientId    = "",
     [string]$CrmClientSecret = "",
@@ -36,13 +29,10 @@ param(
     [string]$CrmEntities    = '["accounts"]',
     [string]$CrmPythonFile  = "crm_sync.py",
 
-    # ── Nomi item Fabric ──
     [string]$LakehouseName      = "LH_Bronze",
-
     [string]$BcMirroringDbName  = "MirrorDB_BC",
     [string]$BcSparkJobName     = "SJD_BC_Sync",
     [string]$BcPipelineName     = "DP_BC_Sync",
-
     [string]$CrmMirroringDbName = "MirrorDB_CRM",
     [string]$CrmSparkJobName    = "SJD_CRM_Sync",
     [string]$CrmPipelineName    = "DP_CRM_Sync",
@@ -52,33 +42,49 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ── Helper: controlla se un valore e' una variabile DevOps non risolta ──
+function Assert-NotUnresolved([string]$Name, [string]$Value) {
+    if ($Value -match '^\$\(') {
+        Write-Host "##[error] '$Name' contiene variabile DevOps non risolta: $Value"
+        Write-Host "##[error] Aggiungere '$($Value -replace '[\$\(\)]','')' al Variable Group in Azure DevOps."
+        exit 1
+    }
+}
+
 $connectorList = $Connectors.Split(",") | ForEach-Object { $_.Trim().ToUpper() }
 Write-Host ""
 Write-Host "============================================"
-Write-Host "[CONFIG] Connettori richiesti: $($connectorList -join ', ')"
+Write-Host "[CONFIG] Connettori: $($connectorList -join ', ')"
+if ($ForceRecreate) { Write-Host "[CONFIG] ForceRecreate: ON" }
 Write-Host "============================================"
+
+# Valida variabili obbligatorie
+Assert-NotUnresolved "TenantId"     $TenantId
+Assert-NotUnresolved "ClientId"     $ClientId
+Assert-NotUnresolved "ClientSecret" $ClientSecret
+Assert-NotUnresolved "WorkspaceId"  $WorkspaceId
 
 foreach ($conn in $connectorList) {
     switch ($conn) {
         "BC" {
-            if ([string]::IsNullOrEmpty($BcTenantId)) {
-                Write-Host "##[error] Connettore BC richiesto ma BcTenantId mancante."
-                exit 1
-            }
+            Assert-NotUnresolved "BcTenantId" $BcTenantId
+            if ([string]::IsNullOrEmpty($BcTenantId)) { Write-Host "##[error] BcTenantId mancante."; exit 1 }
         }
         "CRM" {
-            if ([string]::IsNullOrEmpty($CrmOrgUrl)) {
-                Write-Host "##[error] Connettore CRM richiesto ma CrmOrgUrl mancante."
-                exit 1
-            }
-            if ([string]::IsNullOrEmpty($CrmTenantId))    { $CrmTenantId    = $TenantId }
-            if ([string]::IsNullOrEmpty($CrmClientId))    { $CrmClientId    = $ClientId }
-            if ([string]::IsNullOrEmpty($CrmClientSecret)){ $CrmClientSecret = $ClientSecret }
+            Assert-NotUnresolved "CrmOrgUrl"      $CrmOrgUrl
+            Assert-NotUnresolved "CrmTenantId"    $CrmTenantId
+            Assert-NotUnresolved "CrmClientId"    $CrmClientId
+            Assert-NotUnresolved "CrmClientSecret" $CrmClientSecret
+            Assert-NotUnresolved "CrmEntities"    $CrmEntities
+
+            if ([string]::IsNullOrEmpty($CrmOrgUrl)) { Write-Host "##[error] CrmOrgUrl mancante."; exit 1 }
+
+            # Default: usa credenziali Fabric se non specificate per CRM
+            if ([string]::IsNullOrEmpty($CrmTenantId) -or $CrmTenantId -eq "")    { $CrmTenantId    = $TenantId }
+            if ([string]::IsNullOrEmpty($CrmClientId) -or $CrmClientId -eq "")    { $CrmClientId    = $ClientId }
+            if ([string]::IsNullOrEmpty($CrmClientSecret) -or $CrmClientSecret -eq ""){ $CrmClientSecret = $ClientSecret }
         }
-        default {
-            Write-Host "##[error] Connettore sconosciuto: $conn. Valori validi: BC, CRM"
-            exit 1
-        }
+        default { Write-Host "##[error] Connettore sconosciuto: $conn"; exit 1 }
     }
 }
 
@@ -90,15 +96,9 @@ function To-Base64([string]$str) {
 }
 
 function Invoke-FabricApi {
-    param(
-        [string]$Method,
-        [string]$Url,
-        [hashtable]$Headers,
-        [string]$Body = $null
-    )
+    param([string]$Method, [string]$Url, [hashtable]$Headers, [string]$Body = $null)
     $params = @{ Method = $Method; Uri = $Url; Headers = $Headers }
     if ($Body) { $params["Body"] = $Body }
-
     try {
         $response = Invoke-WebRequest @params -UseBasicParsing
     } catch {
@@ -107,23 +107,17 @@ function Invoke-FabricApi {
             $stream = $ex.Response.GetResponseStream()
             $reader = New-Object System.IO.StreamReader($stream)
             $reader.BaseStream.Position = 0
-            $responseBody = $reader.ReadToEnd()
-            Write-Host "##[error] API Response Body: $responseBody"
-        } else {
-            Write-Host "##[error] API Error: $($ex.Message)"
-        }
+            Write-Host "##[error] API Response Body: $($reader.ReadToEnd())"
+        } else { Write-Host "##[error] API Error: $($ex.Message)" }
         throw
     }
-
     if ($response.StatusCode -eq 202) {
-        $locationUrl   = $response.Headers["Location"]
+        $locationUrl = $response.Headers["Location"]
         $retryAfterRaw = $response.Headers["Retry-After"]
-        if ($retryAfterRaw) { $retryAfter = [int]$retryAfterRaw } else { $retryAfter = 5 }
-
+        $retryAfter = if ($retryAfterRaw) { [int]$retryAfterRaw } else { 5 }
         Write-Host "    [ASYNC] Polling ogni ${retryAfter}s..."
-        do {
-            Start-Sleep -Seconds $retryAfter
-            $pollResp = Invoke-WebRequest -Uri $locationUrl -Headers $Headers -Method GET -UseBasicParsing
+        do { Start-Sleep -Seconds $retryAfter
+             $pollResp = Invoke-WebRequest -Uri $locationUrl -Headers $Headers -Method GET -UseBasicParsing
         } while ($pollResp.StatusCode -eq 202)
         return $pollResp.Content | ConvertFrom-Json
     }
@@ -131,14 +125,7 @@ function Invoke-FabricApi {
 }
 
 function Get-OrCreate-Item {
-    param(
-        [string]$DisplayName,
-        [string]$Type,
-        [string]$CreateUrl,
-        [string]$ListUrl,
-        [string]$BodyJson,
-        [hashtable]$Headers
-    )
+    param([string]$DisplayName, [string]$Type, [string]$CreateUrl, [string]$ListUrl, [string]$BodyJson, [hashtable]$Headers)
     $existing = (Invoke-RestMethod -Uri $ListUrl -Headers $Headers -Method GET).value `
                 | Where-Object { $_.displayName -eq $DisplayName -and $_.type -eq $Type }
     if ($existing) {
@@ -152,12 +139,7 @@ function Get-OrCreate-Item {
 }
 
 function Get-OrCreate-MirroringDb {
-    param(
-        [string]$DisplayName,
-        [string]$Description,
-        [hashtable]$Headers,
-        [string]$BaseUrl
-    )
+    param([string]$DisplayName, [string]$Description, [hashtable]$Headers, [string]$BaseUrl)
     $mirroringPayload = @{
         properties = @{
             source = @{ type = "GenericMirror"; typeProperties = @{} }
@@ -169,14 +151,9 @@ function Get-OrCreate-MirroringDb {
     } | ConvertTo-Json -Depth 10
 
     $mirroringBody = @{
-        displayName = $DisplayName
-        description = $Description
-        definition  = @{
-            parts = @(@{
-                path = "mirroring.json"
-                payload = (To-Base64 $mirroringPayload)
-                payloadType = "InlineBase64"
-            })
+        displayName = $DisplayName; description = $Description
+        definition = @{
+            parts = @(@{ path = "mirroring.json"; payload = (To-Base64 $mirroringPayload); payloadType = "InlineBase64" })
         }
     } | ConvertTo-Json -Depth 10
 
@@ -188,7 +165,6 @@ function Get-OrCreate-MirroringDb {
         Write-Host "  [OK] Mirroring DB '$DisplayName' gia esistente - ID: $($existingMirror.id)"
         return $existingMirror.id
     }
-
     Write-Host "  [NEW] Creo Mirroring Database '$DisplayName'..."
     $mirrorResult = Invoke-FabricApi -Method POST -Url $mirrorListUrl -Headers $Headers -Body $mirroringBody
     $mirroringId  = $mirrorResult.id
@@ -203,14 +179,8 @@ function Get-OrCreate-MirroringDb {
 }
 
 function Deploy-SparkJob {
-    param(
-        [string]$SparkJobName,
-        [string]$PythonFileName,
-        [string]$LakehouseId,
-        [string]$Description,
-        [hashtable]$Headers,
-        [string]$BaseUrl
-    )
+    param([string]$SparkJobName, [string]$PythonFileName, [string]$LakehouseId,
+          [string]$Description, [hashtable]$Headers, [string]$BaseUrl)
 
     $pythonLocalPath = Join-Path $PSScriptRoot "..\python\$PythonFileName"
     Write-Host "  Lettura Python: $pythonLocalPath"
@@ -218,20 +188,15 @@ function Deploy-SparkJob {
     $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
 
     $sparkDefPayload = @{
-        executableFile             = "$PythonFileName"
-        defaultLakehouseArtifactId = $LakehouseId
-        mainClass                  = ""
-        additionalLakehouseIds     = @()
-        retryPolicy                = $null
-        commandLineArguments       = ""
-        additionalLibraryUris      = @()
-        language                   = "Python"
-        environmentArtifactId      = $null
+        executableFile = "$PythonFileName"; defaultLakehouseArtifactId = $LakehouseId
+        mainClass = ""; additionalLakehouseIds = @(); retryPolicy = $null
+        commandLineArguments = ""; additionalLibraryUris = @()
+        language = "Python"; environmentArtifactId = $null
     } | ConvertTo-Json -Depth 10
 
     $sparkDefinition = @{
         format = "SparkJobDefinitionV2"
-        parts  = @(
+        parts = @(
             @{ path = "SparkJobDefinitionV1.json"; payload = (To-Base64 $sparkDefPayload); payloadType = "InlineBase64" },
             @{ path = "Main/$PythonFileName"; payload = $pythonBase64; payloadType = "InlineBase64" }
         )
@@ -245,18 +210,13 @@ function Deploy-SparkJob {
         Write-Host "  [OK] Spark Job '$SparkJobName' gia esistente - ID: $sparkJobId"
         Write-Host "  [UPD] Aggiorno definizione..."
         $updateBody = @{ definition = $sparkDefinition } | ConvertTo-Json -Depth 10
-        Invoke-FabricApi -Method POST `
-            -Url "$BaseUrl/sparkJobDefinitions/$sparkJobId/updateDefinition" `
-            -Headers $Headers -Body $updateBody
+        Invoke-FabricApi -Method POST -Url "$BaseUrl/sparkJobDefinitions/$sparkJobId/updateDefinition" -Headers $Headers -Body $updateBody
         Write-Host "  [OK] Definizione aggiornata"
     } else {
         Write-Host "  [NEW] Creo Spark Job '$SparkJobName'..."
         $sparkBody = @{
-            displayName = $SparkJobName
-            description = $Description
-            definition  = $sparkDefinition
+            displayName = $SparkJobName; description = $Description; definition = $sparkDefinition
         } | ConvertTo-Json -Depth 10
-
         $sjdResult = Invoke-FabricApi -Method POST -Url "$BaseUrl/sparkJobDefinitions" -Headers $Headers -Body $sparkBody
         $sparkJobId = $sjdResult.id
         if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
@@ -270,94 +230,128 @@ function Deploy-SparkJob {
     return [string]$sparkJobId
 }
 
-# ── Costruisce la pipeline definition JSON con ConvertTo-Json ──
-# Niente here-string = niente rischio di $ o ` nel JSON
+# Costruisce JSON pipeline con ConvertTo-Json (NO here-string, NO $ o `)
 function Build-PipelineDefinitionJson {
-    param(
-        [string]$PipelineName,
-        [string]$SparkJobName,
-        [string]$SparkJobId,
-        [string]$WorkspaceId,
-        [string]$LakehouseId,
-        [string]$CommandLineArgs
-    )
+    param([string]$PipelineName, [string]$SparkJobName, [string]$SparkJobId,
+          [string]$WorkspaceId, [string]$LakehouseId, [string]$CommandLineArgs)
     $def = @{
-        name       = $PipelineName
-        objectId   = [guid]::NewGuid().ToString()
+        name = $PipelineName; objectId = [guid]::NewGuid().ToString()
         properties = @{
-            activities = @(
-                @{
-                    name       = $SparkJobName
-                    type       = "FabricSparkJobDefinition"
-                    dependsOn  = @()
-                    policy     = @{
-                        timeout                = "0.12:00:00"
-                        retry                  = 0
-                        retryIntervalInSeconds = 30
-                        secureOutput           = $false
-                        secureInput            = $false
-                    }
-                    typeProperties = @{
-                        sparkJobDefinitionId = $SparkJobId
-                        workspaceId          = $WorkspaceId
-                        commandLineArguments = $CommandLineArgs
-                        defaultLakehouse     = @{
-                            workspaceId = $WorkspaceId
-                            artifactId  = $LakehouseId
-                        }
-                    }
+            activities = @(@{
+                name = $SparkJobName; type = "FabricSparkJobDefinition"; dependsOn = @()
+                policy = @{
+                    timeout = "0.12:00:00"; retry = 0
+                    retryIntervalInSeconds = 30; secureOutput = $false; secureInput = $false
                 }
-            )
+                typeProperties = @{
+                    sparkJobDefinitionId = $SparkJobId; workspaceId = $WorkspaceId
+                    commandLineArguments = $CommandLineArgs
+                    defaultLakehouse = @{ workspaceId = $WorkspaceId; artifactId = $LakehouseId }
+                }
+            })
         }
     }
     return ($def | ConvertTo-Json -Depth 15 -Compress)
 }
 
+# Crea o aggiorna (o forza ricreazione) una Data Pipeline
+function Deploy-Pipeline {
+    param([string]$PipelineName, [string]$PipelineDefJson, [string]$Description,
+          [hashtable]$Headers, [string]$BaseUrl, [bool]$Force)
+
+    $pipelineListUrl  = "$BaseUrl/dataPipelines"
+    $existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $Headers -Method GET).value `
+                        | Where-Object { $_.displayName -eq $PipelineName }
+
+    # ForceRecreate: elimina la pipeline esistente
+    if ($existingPipeline -and $Force) {
+        $oldId = $existingPipeline.id
+        Write-Host "  [DEL] ForceRecreate: elimino pipeline '$PipelineName' ($oldId)..."
+        Invoke-FabricApi -Method DELETE -Url "$BaseUrl/dataPipelines/$oldId" -Headers $Headers
+        Write-Host "  [DEL] Eliminata. Ricreo..."
+        Start-Sleep -Seconds 2
+        $existingPipeline = $null
+    }
+
+    if ($existingPipeline) {
+        $pipelineId = $existingPipeline.id
+        Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
+        Write-Host "  [UPD] Aggiorno la definizione..."
+        $updateBody = @{
+            definition = @{
+                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $PipelineDefJson); payloadType = "InlineBase64" })
+            }
+        } | ConvertTo-Json -Depth 10
+        Invoke-FabricApi -Method POST -Url "$BaseUrl/dataPipelines/$pipelineId/updateDefinition" -Headers $Headers -Body $updateBody
+        Write-Host "  [OK] Definizione aggiornata"
+    } else {
+        Write-Host "  [NEW] Creo Data Pipeline '$PipelineName'..."
+        $pipelineBody = @{
+            displayName = $PipelineName; description = $Description
+            definition = @{
+                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $PipelineDefJson); payloadType = "InlineBase64" })
+            }
+        } | ConvertTo-Json -Depth 10
+        $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $Headers -Body $pipelineBody
+        $pipelineId = $pipelineResult.id
+        if ([string]::IsNullOrWhiteSpace($pipelineId)) {
+            Start-Sleep -Seconds 3
+            $createdPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $Headers -Method GET).value `
+                               | Where-Object { $_.displayName -eq $PipelineName }
+            $pipelineId = $createdPipeline.id
+        }
+        Write-Host "  [OK] Creato - ID: $pipelineId"
+    }
+    return [string]$pipelineId
+}
+
 function Ensure-LakehouseFolder {
-    param(
-        [string]$FolderPath,
-        [string]$DfsToken,
-        [string]$WsId,
-        [string]$LhId
-    )
+    param([string]$FolderPath, [string]$DfsToken, [string]$WsId, [string]$LhId)
     $dfsUrl = "https://onelake.dfs.fabric.microsoft.com/$WsId/$LhId/$FolderPath"
-    $dfsHeaders = @{ Authorization = "Bearer $DfsToken" }
     try {
-        Invoke-WebRequest -Uri "$($dfsUrl)?resource=directory" -Method PUT -Headers $dfsHeaders -UseBasicParsing | Out-Null
+        Invoke-WebRequest -Uri "$($dfsUrl)?resource=directory" -Method PUT `
+            -Headers @{ Authorization = "Bearer $DfsToken" } -UseBasicParsing | Out-Null
         Write-Host "  [OK] Cartella: $FolderPath"
     } catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        if ($statusCode -eq 409) {
+        if ($_.Exception.Response.StatusCode.value__ -eq 409) {
             Write-Host "  [OK] Cartella gia esistente: $FolderPath"
-        } else {
-            Write-Host "  [WARN] Impossibile creare cartella $FolderPath : $($_.Exception.Message)"
-        }
+        } else { Write-Host "  [WARN] Cartella $FolderPath : $($_.Exception.Message)" }
     }
 }
 
+# Valida che sparkArgs non contenga $ o `
+function Assert-SparkArgsSafe([string]$SparkArgs, [string]$ConnectorName) {
+    if ($SparkArgs.Contains('$')) {
+        Write-Host "##[error] [$ConnectorName] commandLineArguments contengono il carattere DOLLARO!"
+        Write-Host "##[error] Questo significa che una variabile DevOps non e' stata risolta."
+        Write-Host "##[error] Valore: $SparkArgs"
+        exit 1
+    }
+    if ($SparkArgs.Contains('``')) {
+        Write-Host "##[error] [$ConnectorName] commandLineArguments contengono il carattere BACKTICK!"
+        exit 1
+    }
+    Write-Host "  [SAFE] commandLineArguments validati (nessun $ o backtick)"
+}
+
 # ─────────────────────────────────────────
-# 0. AUTENTICAZIONE FABRIC
+# 0. AUTENTICAZIONE
 # ─────────────────────────────────────────
 Write-Host ""
 Write-Host "[AUTH] Autenticazione Service Principal..."
 $tokenUrl  = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
 $tokenBody = @{
-    grant_type    = "client_credentials"
-    client_id     = $ClientId
-    client_secret = $ClientSecret
-    scope         = "https://api.fabric.microsoft.com/.default"
+    grant_type = "client_credentials"; client_id = $ClientId
+    client_secret = $ClientSecret; scope = "https://api.fabric.microsoft.com/.default"
 }
 $token   = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $tokenBody).access_token
 $headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
 $baseUrl = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId"
 Write-Host "[OK] Token Fabric ottenuto"
 
-# Token per OneLake DFS
 $onelakeTokenBody = @{
-    grant_type    = "client_credentials"
-    client_id     = $ClientId
-    client_secret = $ClientSecret
-    scope         = "https://storage.azure.com/.default"
+    grant_type = "client_credentials"; client_id = $ClientId
+    client_secret = $ClientSecret; scope = "https://storage.azure.com/.default"
 }
 $onelakeToken = (Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $onelakeTokenBody).access_token
 Write-Host "[OK] Token OneLake ottenuto"
@@ -370,64 +364,51 @@ $deployedItems = @{}
 Write-Host ""
 Write-Host "=== STEP 1: Lakehouse Condiviso ==="
 $lakehouseBody = @{
-    displayName = $LakehouseName
-    type        = "Lakehouse"
+    displayName = $LakehouseName; type = "Lakehouse"
     description = "Lakehouse Bronze - landing zone condivisa"
 } | ConvertTo-Json -Depth 5
 
-$lakehouseId = Get-OrCreate-Item `
-    -DisplayName $LakehouseName -Type "Lakehouse" `
+$lakehouseId = Get-OrCreate-Item -DisplayName $LakehouseName -Type "Lakehouse" `
     -CreateUrl "$baseUrl/lakehouses" -ListUrl "$baseUrl/lakehouses" `
     -BodyJson $lakehouseBody -Headers $headers
-
 $lakehouseId = ([string]$lakehouseId).Trim()
 Write-Host "  Lakehouse ID: $lakehouseId"
 
-# Struttura cartelle
 Write-Host ""
 Write-Host "=== STEP 1b: Struttura Cartelle ==="
-$folders = @("Files/BC", "Files/BC/Scripts", "Files/CRM", "Files/CRM/Scripts",
-             "Files/Orchestration", "Files/MirroringState", "Files/MirroringKeys")
-foreach ($f in $folders) {
+foreach ($f in @("Files/BC","Files/BC/Scripts","Files/CRM","Files/CRM/Scripts",
+                 "Files/Orchestration","Files/MirroringState","Files/MirroringKeys")) {
     Ensure-LakehouseFolder -FolderPath $f -DfsToken $onelakeToken -WsId $WorkspaceId -LhId $lakehouseId
 }
 
 # =========================================================
-# DEPLOY BC CONNECTOR
+# DEPLOY BC
 # =========================================================
 if ($connectorList -contains "BC") {
     Write-Host ""
     Write-Host "####################################################"
-    Write-Host "# DEPLOY CONNETTORE: BUSINESS CENTRAL"
+    Write-Host "# DEPLOY: BUSINESS CENTRAL"
     Write-Host "####################################################"
 
     Write-Host ""
     Write-Host "=== BC STEP 2: Mirroring Database ==="
-    $mirroringId = Get-OrCreate-MirroringDb `
-        -DisplayName $BcMirroringDbName -Description "Open Mirroring - Business Central" `
-        -Headers $headers -BaseUrl $baseUrl
+    $mirroringId = ([string](Get-OrCreate-MirroringDb `
+        -DisplayName $BcMirroringDbName -Description "Open Mirroring - BC" `
+        -Headers $headers -BaseUrl $baseUrl)).Trim()
 
     Write-Host ""
-    Write-Host "=== BC STEP 3: Spark Job Definition ==="
-    $sparkJobId = Deploy-SparkJob `
-        -SparkJobName $BcSparkJobName -PythonFileName $BcPythonFile `
-        -LakehouseId $lakehouseId -Description "Spark Job BC Sync" `
-        -Headers $headers -BaseUrl $baseUrl
+    Write-Host "=== BC STEP 3: Spark Job ==="
+    $sparkJobId = ([string](Deploy-SparkJob -SparkJobName $BcSparkJobName `
+        -PythonFileName $BcPythonFile -LakehouseId $lakehouseId `
+        -Description "Spark Job BC Sync" -Headers $headers -BaseUrl $baseUrl)).Trim()
 
     Write-Host ""
     Write-Host "=== BC STEP 4: Data Pipeline ==="
-
-    $sparkJobId  = ([string]$sparkJobId).Trim()
-    $mirroringId = ([string]$mirroringId).Trim()
-
     Write-Host "  Spark Job ID: $sparkJobId"
     Write-Host "  Mirroring ID: $mirroringId"
+    if ([string]::IsNullOrWhiteSpace($sparkJobId)) { Write-Host "##[error] sparkJobId BC vuoto!"; exit 1 }
 
-    if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
-        Write-Host "##[error] sparkJobId BC e' vuoto!"; exit 1
-    }
-
-    # Costruisci commandLineArguments - TUTTO in Base64
+    # Costruisci args - TUTTI i valori sensibili in Base64
     $sparkArgs = @(
         "--BC_TENANT_ID",            $BcTenantId,
         "--BC_CLIENT_ID",            $ClientId,
@@ -443,99 +424,49 @@ if ($connectorList -contains "BC") {
         "--FABRIC_CLIENT_SECRET_B64", (To-Base64 $ClientSecret)
     ) -join " "
 
-    Write-Host "  commandLineArguments costruiti (secrets in Base64)"
+    Assert-SparkArgsSafe $sparkArgs "BC"
 
-    # Costruisci JSON con ConvertTo-Json (NO here-string, NO rischio $ o `)
     $pipelineDefJson = Build-PipelineDefinitionJson `
-        -PipelineName    $BcPipelineName `
-        -SparkJobName    $BcSparkJobName `
-        -SparkJobId      $sparkJobId `
-        -WorkspaceId     $WorkspaceId `
-        -LakehouseId     $lakehouseId `
-        -CommandLineArgs $sparkArgs
+        -PipelineName $BcPipelineName -SparkJobName $BcSparkJobName `
+        -SparkJobId $sparkJobId -WorkspaceId $WorkspaceId `
+        -LakehouseId $lakehouseId -CommandLineArgs $sparkArgs
 
-    Write-Host "  [DEBUG] Pipeline definition BC costruita (ConvertTo-Json)"
+    $pipelineId = Deploy-Pipeline -PipelineName $BcPipelineName `
+        -PipelineDefJson $pipelineDefJson -Description "Pipeline BC Sync" `
+        -Headers $headers -BaseUrl $baseUrl -Force $ForceRecreate.IsPresent
 
-    $pipelineListUrl  = "$baseUrl/dataPipelines"
-    $existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
-                        | Where-Object { $_.displayName -eq $BcPipelineName }
-
-    if ($existingPipeline) {
-        $pipelineId = $existingPipeline.id
-        Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
-        Write-Host "  [UPD] Aggiorno la definizione..."
-
-        $updateBody = @{
-            definition = @{
-                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $pipelineDefJson); payloadType = "InlineBase64" })
-            }
-        } | ConvertTo-Json -Depth 10
-
-        Invoke-FabricApi -Method POST `
-            -Url "$baseUrl/dataPipelines/$pipelineId/updateDefinition" `
-            -Headers $headers -Body $updateBody
-        Write-Host "  [OK] Definizione aggiornata"
-    } else {
-        Write-Host "  [NEW] Creo Data Pipeline '$BcPipelineName'..."
-        $pipelineBody = @{
-            displayName = $BcPipelineName
-            description = "Pipeline BC Sync"
-            definition  = @{
-                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $pipelineDefJson); payloadType = "InlineBase64" })
-            }
-        } | ConvertTo-Json -Depth 10
-
-        $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBody
-        $pipelineId     = $pipelineResult.id
-        if ([string]::IsNullOrWhiteSpace($pipelineId)) {
-            Start-Sleep -Seconds 3
-            $createdPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
-                               | Where-Object { $_.displayName -eq $BcPipelineName }
-            $pipelineId = $createdPipeline.id
-        }
-        Write-Host "  [OK] Creato - ID: $pipelineId"
-    }
-
-    $deployedItems["BC"] = @{ MirroringDb = $mirroringId; SparkJob = $sparkJobId; Pipeline = $pipelineId }
+    $deployedItems["BC"] = @{ MirroringDb=$mirroringId; SparkJob=$sparkJobId; Pipeline=$pipelineId }
     Write-Host "##vso[task.setvariable variable=BC_MIRRORING_ID]$mirroringId"
     Write-Host "##vso[task.setvariable variable=BC_SPARK_JOB_ID]$sparkJobId"
     Write-Host "##vso[task.setvariable variable=BC_PIPELINE_ID]$pipelineId"
 }
 
 # =========================================================
-# DEPLOY CRM CONNECTOR
+# DEPLOY CRM
 # =========================================================
 if ($connectorList -contains "CRM") {
     Write-Host ""
     Write-Host "####################################################"
-    Write-Host "# DEPLOY CONNETTORE: CRM / DATAVERSE"
+    Write-Host "# DEPLOY: CRM / DATAVERSE"
     Write-Host "####################################################"
 
     Write-Host ""
     Write-Host "=== CRM STEP 2: Mirroring Database ==="
-    $mirroringId = Get-OrCreate-MirroringDb `
-        -DisplayName $CrmMirroringDbName -Description "Open Mirroring - CRM / Dataverse" `
-        -Headers $headers -BaseUrl $baseUrl
+    $mirroringId = ([string](Get-OrCreate-MirroringDb `
+        -DisplayName $CrmMirroringDbName -Description "Open Mirroring - CRM" `
+        -Headers $headers -BaseUrl $baseUrl)).Trim()
 
     Write-Host ""
-    Write-Host "=== CRM STEP 3: Spark Job Definition ==="
-    $sparkJobId = Deploy-SparkJob `
-        -SparkJobName $CrmSparkJobName -PythonFileName $CrmPythonFile `
-        -LakehouseId $lakehouseId -Description "Spark Job CRM Sync" `
-        -Headers $headers -BaseUrl $baseUrl
+    Write-Host "=== CRM STEP 3: Spark Job ==="
+    $sparkJobId = ([string](Deploy-SparkJob -SparkJobName $CrmSparkJobName `
+        -PythonFileName $CrmPythonFile -LakehouseId $lakehouseId `
+        -Description "Spark Job CRM Sync" -Headers $headers -BaseUrl $baseUrl)).Trim()
 
     Write-Host ""
     Write-Host "=== CRM STEP 4: Data Pipeline ==="
-
-    $sparkJobId  = ([string]$sparkJobId).Trim()
-    $mirroringId = ([string]$mirroringId).Trim()
-
     Write-Host "  Spark Job ID: $sparkJobId"
     Write-Host "  Mirroring ID: $mirroringId"
-
-    if ([string]::IsNullOrWhiteSpace($sparkJobId)) {
-        Write-Host "##[error] sparkJobId CRM e' vuoto!"; exit 1
-    }
+    if ([string]::IsNullOrWhiteSpace($sparkJobId)) { Write-Host "##[error] sparkJobId CRM vuoto!"; exit 1 }
 
     $sparkArgs = @(
         "--CRM_TENANT_ID",             $CrmTenantId,
@@ -552,59 +483,18 @@ if ($connectorList -contains "CRM") {
         "--FABRIC_CLIENT_SECRET_B64",  (To-Base64 $ClientSecret)
     ) -join " "
 
-    Write-Host "  commandLineArguments costruiti (secrets in Base64)"
+    Assert-SparkArgsSafe $sparkArgs "CRM"
 
     $pipelineDefJson = Build-PipelineDefinitionJson `
-        -PipelineName    $CrmPipelineName `
-        -SparkJobName    $CrmSparkJobName `
-        -SparkJobId      $sparkJobId `
-        -WorkspaceId     $WorkspaceId `
-        -LakehouseId     $lakehouseId `
-        -CommandLineArgs $sparkArgs
+        -PipelineName $CrmPipelineName -SparkJobName $CrmSparkJobName `
+        -SparkJobId $sparkJobId -WorkspaceId $WorkspaceId `
+        -LakehouseId $lakehouseId -CommandLineArgs $sparkArgs
 
-    Write-Host "  [DEBUG] Pipeline definition CRM costruita (ConvertTo-Json)"
+    $pipelineId = Deploy-Pipeline -PipelineName $CrmPipelineName `
+        -PipelineDefJson $pipelineDefJson -Description "Pipeline CRM Sync" `
+        -Headers $headers -BaseUrl $baseUrl -Force $ForceRecreate.IsPresent
 
-    $pipelineListUrl  = "$baseUrl/dataPipelines"
-    $existingPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
-                        | Where-Object { $_.displayName -eq $CrmPipelineName }
-
-    if ($existingPipeline) {
-        $pipelineId = $existingPipeline.id
-        Write-Host "  [OK] Pipeline gia esistente - ID: $pipelineId"
-        Write-Host "  [UPD] Aggiorno la definizione..."
-
-        $updateBody = @{
-            definition = @{
-                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $pipelineDefJson); payloadType = "InlineBase64" })
-            }
-        } | ConvertTo-Json -Depth 10
-
-        Invoke-FabricApi -Method POST `
-            -Url "$baseUrl/dataPipelines/$pipelineId/updateDefinition" `
-            -Headers $headers -Body $updateBody
-        Write-Host "  [OK] Definizione aggiornata"
-    } else {
-        Write-Host "  [NEW] Creo Data Pipeline '$CrmPipelineName'..."
-        $pipelineBody = @{
-            displayName = $CrmPipelineName
-            description = "Pipeline CRM Sync"
-            definition  = @{
-                parts = @(@{ path = "pipeline-content.json"; payload = (To-Base64 $pipelineDefJson); payloadType = "InlineBase64" })
-            }
-        } | ConvertTo-Json -Depth 10
-
-        $pipelineResult = Invoke-FabricApi -Method POST -Url $pipelineListUrl -Headers $headers -Body $pipelineBody
-        $pipelineId     = $pipelineResult.id
-        if ([string]::IsNullOrWhiteSpace($pipelineId)) {
-            Start-Sleep -Seconds 3
-            $createdPipeline = (Invoke-RestMethod -Uri $pipelineListUrl -Headers $headers -Method GET).value `
-                               | Where-Object { $_.displayName -eq $CrmPipelineName }
-            $pipelineId = $createdPipeline.id
-        }
-        Write-Host "  [OK] Creato - ID: $pipelineId"
-    }
-
-    $deployedItems["CRM"] = @{ MirroringDb = $mirroringId; SparkJob = $sparkJobId; Pipeline = $pipelineId }
+    $deployedItems["CRM"] = @{ MirroringDb=$mirroringId; SparkJob=$sparkJobId; Pipeline=$pipelineId }
     Write-Host "##vso[task.setvariable variable=CRM_MIRRORING_ID]$mirroringId"
     Write-Host "##vso[task.setvariable variable=CRM_SPARK_JOB_ID]$sparkJobId"
     Write-Host "##vso[task.setvariable variable=CRM_PIPELINE_ID]$pipelineId"
@@ -619,7 +509,6 @@ Write-Host "[OK] DEPLOY COMPLETATO"
 Write-Host "============================================"
 Write-Host "  Connettori: $($connectorList -join ', ')"
 Write-Host "  Lakehouse : $lakehouseId ($LakehouseName)"
-Write-Host ""
 foreach ($conn in $deployedItems.Keys) {
     $items = $deployedItems[$conn]
     Write-Host "  --- $conn ---"
