@@ -25,9 +25,6 @@ parameters:
 
 variables:
   - group: fabric-deploy-${{ parameters.targetEnvironment }}
-  # Le variabili CRM_* sono opzionali e presenti solo se il connettore CRM è abilitato.
-  # Creare nel Variable Group: CRM_TENANT_ID, CRM_CLIENT_ID, CRM_CLIENT_SECRET,
-  #                            CRM_ORG_URL, CRM_ENTITIES, CRM_API_VERSION (opzionale)
 
 stages:
   - stage: DeployFabric
@@ -63,8 +60,6 @@ stages:
                 # Variabili obbligatorie per CRM
                 if ($connectors -contains "CRM") {
                   $required += @("CRM_ORG_URL","CRM_ENTITIES")
-                  # CRM_TENANT_ID, CRM_CLIENT_ID, CRM_CLIENT_SECRET sono opzionali
-                  # (default: stesse credenziali Fabric)
                 }
 
                 $ok = $true
@@ -83,22 +78,19 @@ stages:
                 }
                 if (-not $ok) { exit 1 }
             env:
-              # Fabric (sempre)
               FABRIC_TENANT_ID:     $(FABRIC_TENANT_ID)
               FABRIC_CLIENT_ID:     $(FABRIC_CLIENT_ID)
               FABRIC_CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
               FABRIC_WORKSPACE_ID:  $(FABRIC_WORKSPACE_ID)
-              # BC (condizionali)
-              BC_TENANT_ID:         ${{ if contains(parameters.connectors, 'BC') }}:$(BC_TENANT_ID)
-              BC_ENVIRONMENT:       ${{ if contains(parameters.connectors, 'BC') }}:$(BC_ENVIRONMENT)
-              BC_COMPANIES:         ${{ if contains(parameters.connectors, 'BC') }}:$(BC_COMPANIES)
-              BC_ENTITIES:          ${{ if contains(parameters.connectors, 'BC') }}:$(BC_ENTITIES)
-              # CRM (condizionali)
-              CRM_ORG_URL:          ${{ if contains(parameters.connectors, 'CRM') }}:$(CRM_ORG_URL)
-              CRM_ENTITIES:         ${{ if contains(parameters.connectors, 'CRM') }}:$(CRM_ENTITIES)
-              CRM_TENANT_ID:        ${{ if contains(parameters.connectors, 'CRM') }}:$(CRM_TENANT_ID)
-              CRM_CLIENT_ID:        ${{ if contains(parameters.connectors, 'CRM') }}:$(CRM_CLIENT_ID)
-              CRM_CLIENT_SECRET:    ${{ if contains(parameters.connectors, 'CRM') }}:$(CRM_CLIENT_SECRET)
+              BC_TENANT_ID:         $(BC_TENANT_ID)
+              BC_ENVIRONMENT:       $(BC_ENVIRONMENT)
+              BC_COMPANIES:         $(BC_COMPANIES)
+              BC_ENTITIES:          $(BC_ENTITIES)
+              CRM_ORG_URL:          $(CRM_ORG_URL)
+              CRM_ENTITIES:         $(CRM_ENTITIES)
+              CRM_TENANT_ID:        $(CRM_TENANT_ID)
+              CRM_CLIENT_ID:        $(CRM_CLIENT_ID)
+              CRM_CLIENT_SECRET:    $(CRM_CLIENT_SECRET)
 
           # -- Deploy tutti gli item Fabric --
           - task: PowerShell@2
