@@ -17,8 +17,8 @@ param(
 
     [string]$BcTenantId     = "",
     [string]$BcEnvironment  = "SandboxTest",
-    [string]$BcCompanies    = '["CRONUS%20IT"]',
-    [string]$BcEntities     = '["ItemLedgerEntries"]',
+    [string]$BcCompanies    = 'CRONUS%20IT',
+    [string]$BcEntities     = 'ItemLedgerEntries',
     [string]$BcPythonFile   = "bc_sync.py",
 
     [string]$CrmTenantId    = "",
@@ -26,7 +26,7 @@ param(
     [string]$CrmClientSecret = "",
     [string]$CrmOrgUrl      = "",
     [string]$CrmApiVersion  = "v9.2",
-    [string]$CrmEntities    = '["accounts"]',
+    [string]$CrmEntities    = 'accounts',
     [string]$CrmPythonFile  = "crm_sync.py",
 
     [string]$LakehouseName      = "LH_Bronze",
@@ -41,6 +41,27 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ── Normalizza valori JSON-array ──────────────────────────────────────
+# Le variabili DevOps NON devono contenere brackets [] perche' YAML li
+# corrompe. Lo script accetta valori semplici ("val") o CSV ("a,b") e
+# li converte in JSON array '["val"]' / '["a","b"]'.
+# Se il valore contiene gia' '[' viene lasciato invariato (retrocompat.).
+function Normalize-JsonArray([string]$Raw) {
+    $v = $Raw.Trim()
+    if ($v.StartsWith('[')) { return $v }                       # gia' JSON
+    $items = $v.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    $inner = ($items | ForEach-Object { "`"$_`"" }) -join ','
+    return "[$inner]"
+}
+
+$BcCompanies  = Normalize-JsonArray $BcCompanies
+$BcEntities   = Normalize-JsonArray $BcEntities
+$CrmEntities  = Normalize-JsonArray $CrmEntities
+
+Write-Host "[NORM] BcCompanies  = $BcCompanies"
+Write-Host "[NORM] BcEntities   = $BcEntities"
+Write-Host "[NORM] CrmEntities  = $CrmEntities"
 
 # ── Helper: controlla se un valore e' una variabile DevOps non risolta ──
 function Assert-NotUnresolved([string]$Name, [string]$Value) {
