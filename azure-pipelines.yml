@@ -50,7 +50,10 @@ variables:
 
 stages:
   - stage: DeployFabric
-    displayName: "Deploy Fabric - ${{ parameters.targetEnvironment }}${{ if ne(parameters.targetCustomer, '') }} - ${{ parameters.targetCustomer }}${{ end }} [${{ parameters.connectors }}]"
+    ${{ if ne(parameters.targetCustomer, '') }}:
+      displayName: ${{ format('Deploy Fabric - {0} - {1} [{2}]', parameters.targetEnvironment, parameters.targetCustomer, parameters.connectors) }}
+    ${{ if eq(parameters.targetCustomer, '') }}:
+      displayName: ${{ format('Deploy Fabric - {0} [{1}]', parameters.targetEnvironment, parameters.connectors) }}
     jobs:
       - job: Deploy
         displayName: "Deploy items (${{ parameters.connectors }})"
