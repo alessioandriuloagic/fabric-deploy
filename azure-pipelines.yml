@@ -24,9 +24,9 @@ parameters:
       - prod
 
   - name: targetCustomer
-    displayName: "Cliente (lascia vuoto per default)"
+    displayName: "Cliente (lascia 'default' per il gruppo base)"
     type: string
-    default: ""
+    default: "default"
 
   - name: connectors
     displayName: "Connettori da installare"
