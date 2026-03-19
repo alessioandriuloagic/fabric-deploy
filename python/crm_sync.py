@@ -311,9 +311,15 @@ def get_crm_token():
         client_id=CRM_CLIENT_ID,
         client_secret=CRM_CLIENT_SECRET
     )
-    scope = f"{CRM_ORG_URL}/.default"
+    # Normalizza URL: aggiunge https:// se mancante
+    org_url = CRM_ORG_URL.strip()
+    if not org_url.startswith("https://") and not org_url.startswith("http://"):
+        org_url = f"https://{org_url}"
+    scope = f"{org_url}/.default"
+    print(f"[AUTH] Scope usato: {scope}") 
     token = credential.get_token(scope)
     return token.token
+
 
 def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_keys=None, key_columns=None, keep_data_for_delete=False):
     base_url = f"{CRM_ORG_URL}/api/data/{CRM_API_VERSION}/{entity}"
