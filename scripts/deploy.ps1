@@ -201,13 +201,45 @@ function Get-OrCreate-MirroringDb {
 
 function Start-Mirroring {
     param([string]$WorkspaceId, [string]$MirroringId, [hashtable]$Headers, [string]$BaseUrl)
-    $url = "$BaseUrl/mirroredDatabases/$MirroringId/startMirroring"
-    Write-Host "  Avvio mirroring (POST $url)..."
+
+    # Attendi che il mirroring esca dallo stato Initializing prima di avviarlo
+    $statusUrl = "$BaseUrl/mirroredDatabases/$MirroringId/getMirroringStatus"
+    $maxWaitSec = 120
+    $waited     = 0
+    $interval   = 10
+    Write-Host "  Verifica stato mirroring..."
+    do {
+        try {
+            $statusResult = Invoke-RestMethod -Uri $statusUrl -Headers $Headers -Method POST -UseBasicParsing
+            $currentStatus = $statusResult.status
+        } catch {
+            $currentStatus = "Unknown"
+        }
+        Write-Host "  Stato: $currentStatus"
+        if ($currentStatus -eq "Initializing") {
+            if ($waited -ge $maxWaitSec) {
+                Write-Host "  [WARN] Timeout attesa stato mirroring ($maxWaitSec s) - provo comunque ad avviare."
+                break
+            }
+            Write-Host "  In attesa ($waited/$maxWaitSec s)..."
+            Start-Sleep -Seconds $interval
+            $waited += $interval
+        }
+    } while ($currentStatus -eq "Initializing")
+
+    # Non avviare se gia in esecuzione
+    if ($currentStatus -eq "Running") {
+        Write-Host "  [OK] Mirroring gia in esecuzione."
+        return
+    }
+
+    $startUrl = "$BaseUrl/mirroredDatabases/$MirroringId/startMirroring"
+    Write-Host "  Avvio mirroring..."
     try {
-        Invoke-FabricApi -Method POST -Url $url -Headers $Headers | Out-Null
+        Invoke-FabricApi -Method POST -Url $startUrl -Headers $Headers | Out-Null
         Write-Host "  [OK] Mirroring avviato."
     } catch {
-        Write-Host "  [WARN] startMirroring ha restituito un errore (potrebbe essere gia in esecuzione): $_"
+        Write-Host "  [WARN] startMirroring errore: $_"
     }
 }
 
