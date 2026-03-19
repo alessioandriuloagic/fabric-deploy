@@ -1,6 +1,13 @@
 # =============================================================
 # azure-pipelines.yml
-# Pipeline di release per deploy soluzione Fabric
+# Pipeline di release modulare - Fabric Data Integration
+# 1 Lakehouse condiviso (LH_Bronze) + connettori selezionabili
+#
+# IMPORTANTE: Le variabili CRM (CRM_TENANT_ID, CRM_CLIENT_ID,
+# CRM_CLIENT_SECRET, CRM_ORG_URL, CRM_ENTITIES) devono esistere
+# nel Variable Group quando si usa il connettore CRM.
+# Se non esistono, Azure DevOps le passa come literal "$(VAR)"
+# che contiene $ e fa fallire Fabric.
 # =============================================================
 trigger: none
 
@@ -13,39 +20,78 @@ parameters:
       - dev
       - prod
 
+  - name: connectors
+    displayName: "Connettori da installare"
+    type: string
+    default: "BC"
+    values:
+      - "BC"
+      - "CRM"
+      - "BC,CRM"
+
+  - name: forceRecreate
+    displayName: "Forza ricreazione pipeline (elimina e ricrea)"
+    type: boolean
+    default: false
+
 variables:
   - group: fabric-deploy-${{ parameters.targetEnvironment }}
 
 stages:
   - stage: DeployFabric
-    displayName: "Deploy Fabric - ${{ parameters.targetEnvironment }}"
+    displayName: "Deploy Fabric - ${{ parameters.targetEnvironment }} [${{ parameters.connectors }}]"
     jobs:
       - job: Deploy
-        displayName: "Deploy items"
+        displayName: "Deploy items (${{ parameters.connectors }})"
         pool:
           vmImage: "windows-latest"
 
         steps:
           - checkout: self
 
-          # -- Verifica variabili obbligatorie --
           - task: PowerShell@2
             displayName: "Verifica variabili"
             inputs:
               targetType: inline
               script: |
+                $connectors = "${{ parameters.connectors }}".Split(",") | ForEach-Object { $_.Trim().ToUpper() }
+                Write-Host "[CONFIG] Connettori: $($connectors -join ', ')"
+
+                # Variabili sempre obbligatorie
                 $required = @(
-                  "FABRIC_TENANT_ID","FABRIC_CLIENT_ID","FABRIC_CLIENT_SECRET","FABRIC_WORKSPACE_ID",
-                  "BC_TENANT_ID","BC_ENVIRONMENT","BC_COMPANIES","BC_ENTITIES"
+                  @{Name="FABRIC_TENANT_ID";     Val=$env:FABRIC_TENANT_ID},
+                  @{Name="FABRIC_CLIENT_ID";     Val=$env:FABRIC_CLIENT_ID},
+                  @{Name="FABRIC_CLIENT_SECRET"; Val=$env:FABRIC_CLIENT_SECRET},
+                  @{Name="FABRIC_WORKSPACE_ID";  Val=$env:FABRIC_WORKSPACE_ID}
                 )
+
+                if ($connectors -contains "BC") {
+                  $required += @(
+                    @{Name="BC_TENANT_ID";  Val=$env:BC_TENANT_ID},
+                    @{Name="BC_ENVIRONMENT"; Val=$env:BC_ENVIRONMENT},
+                    @{Name="BC_COMPANIES";  Val=$env:BC_COMPANIES},
+                    @{Name="BC_ENTITIES";   Val=$env:BC_ENTITIES}
+                  )
+                }
+
+                if ($connectors -contains "CRM") {
+                  $required += @(
+                    @{Name="CRM_ORG_URL";  Val=$env:CRM_ORG_URL},
+                    @{Name="CRM_ENTITIES"; Val=$env:CRM_ENTITIES}
+                  )
+                }
+
                 $ok = $true
-                foreach ($v in $required) {
-                  $val = [System.Environment]::GetEnvironmentVariable($v)
+                foreach ($item in $required) {
+                  $v = $item.Name
+                  $val = $item.Val
                   if ([string]::IsNullOrEmpty($val)) {
-                    Write-Host "##vso[task.logissue type=error]Variabile mancante: $v"
+                    Write-Host "##vso[task.logissue type=error]Variabile mancante: $v (aggiungerla al Variable Group)"
+                    $ok = $false
+                  } elseif ($val -match '^\$\(') {
+                    Write-Host "##vso[task.logissue type=error]Variabile non risolta: $v = $val (non esiste nel Variable Group!)"
                     $ok = $false
                   } else {
-                    # Non stampare il valore dei secret
                     if ($v -like "*SECRET*") {
                       Write-Host "[OK] $v = ********"
                     } else {
@@ -63,8 +109,12 @@ stages:
               BC_ENVIRONMENT:       $(BC_ENVIRONMENT)
               BC_COMPANIES:         $(BC_COMPANIES)
               BC_ENTITIES:          $(BC_ENTITIES)
+              CRM_ORG_URL:          $(CRM_ORG_URL)
+              CRM_ENTITIES:         $(CRM_ENTITIES)
+              CRM_TENANT_ID:        $(CRM_TENANT_ID)
+              CRM_CLIENT_ID:        $(CRM_CLIENT_ID)
+              CRM_CLIENT_SECRET:    $(CRM_CLIENT_SECRET)
 
-          # -- Deploy tutti gli item Fabric --
           - task: PowerShell@2
             displayName: "Deploy Fabric items"
             inputs:
@@ -74,11 +124,16 @@ stages:
                 -ClientId       "$(FABRIC_CLIENT_ID)"
                 -ClientSecret   "$(FABRIC_CLIENT_SECRET)"
                 -WorkspaceId    "$(FABRIC_WORKSPACE_ID)"
+                -Connectors     "${{ parameters.connectors }}"
                 -BcTenantId     "$(BC_TENANT_ID)"
                 -BcEnvironment  "$(BC_ENVIRONMENT)"
-                -BcCompanies    "$env:BC_COMPANIES"
-                -BcEntities     "$env:BC_ENTITIES"
-                -PythonFileName "$(PYTHON_FILE_NAME)"
-            env:
-              BC_COMPANIES: $(BC_COMPANIES)
-              BC_ENTITIES:  $(BC_ENTITIES)
+                -BcCompanies    "$(BC_COMPANIES)"
+                -BcEntities     "$(BC_ENTITIES)"
+                -BcPythonFile   "bc_sync.py"
+                -CrmTenantId    "$(CRM_TENANT_ID)"
+                -CrmClientId    "$(CRM_CLIENT_ID)"
+                -CrmClientSecret "$(CRM_CLIENT_SECRET)"
+                -CrmOrgUrl      "$(CRM_ORG_URL)"
+                -CrmEntities    "$(CRM_ENTITIES)"
+                -CrmPythonFile  "crm_sync.py"
+                -ForceRecreate:$${{ parameters.forceRecreate }}

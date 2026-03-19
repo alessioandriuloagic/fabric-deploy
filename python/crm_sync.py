@@ -38,12 +38,16 @@ def _get_param_b64(name, default=None):
             return raw  # fallback: valore non codificato
     return default
 
-# Business Central
-BC_TENANT_ID     = _get_param("BC_TENANT_ID")
-BC_CLIENT_ID     = _get_param("BC_CLIENT_ID")
-BC_CLIENT_SECRET = _get_param_b64("BC_CLIENT_SECRET_B64") or _get_param("BC_CLIENT_SECRET")
+# Dataverse / CRM
+CRM_TENANT_ID     = _get_param("CRM_TENANT_ID")
+CRM_CLIENT_ID     = _get_param("CRM_CLIENT_ID")
+CRM_CLIENT_SECRET = _get_param_b64("CRM_CLIENT_SECRET_B64") or _get_param("CRM_CLIENT_SECRET")
 
-ENVIRONMENT = _get_param("BC_ENVIRONMENT", "SandboxTest")
+# URL dell'organizzazione Dataverse (es: https://orgname.crm4.dynamics.com)
+CRM_ORG_URL       = _get_param("CRM_ORG_URL", "").rstrip("/")
+
+# Versione Web API (default v9.2)
+CRM_API_VERSION   = _get_param("CRM_API_VERSION", "v9.2")
 
 def _decode_b64_param(name, default_json='[]'):
     raw = _get_param(name)
@@ -51,10 +55,8 @@ def _decode_b64_param(name, default_json='[]'):
         return base64.b64decode(raw).decode('utf-8')
     return default_json
 
-_companies_raw = _decode_b64_param("BC_COMPANIES_B64", '["CRONUS%20IT"]')
-COMPANIES = json.loads(_companies_raw)
-
-_entities_raw = _decode_b64_param("BC_ENTITIES_B64", '["ItemLedgerEntries"]')
+# Entities da sincronizzare (nomi EntitySet Dataverse, es: accounts, contacts, opportunities)
+_entities_raw = _decode_b64_param("CRM_ENTITIES_B64", '["accounts"]')
 ENTITIES = json.loads(_entities_raw)
 
 # OneLake
@@ -65,18 +67,19 @@ MIRRORED_DB_ID    = _get_param("FABRIC_MIRRORED_DB_ID")
 TARGET_FOLDER      = "Files/LandingZone"
 KEYS_TARGET_FOLDER = "Files/MirroringKeys"
 
-# OneLake Service Principal
-ONELAKE_TENANT_ID     = _get_param("FABRIC_TENANT_ID",     BC_TENANT_ID)
-ONELAKE_CLIENT_ID     = _get_param("FABRIC_CLIENT_ID",     BC_CLIENT_ID)
-ONELAKE_CLIENT_SECRET = _get_param_b64("FABRIC_CLIENT_SECRET_B64") or _get_param("FABRIC_CLIENT_SECRET") or BC_CLIENT_SECRET
+# OneLake Service Principal (default: stessi del CRM)
+ONELAKE_TENANT_ID     = _get_param("FABRIC_TENANT_ID",     CRM_TENANT_ID)
+ONELAKE_CLIENT_ID     = _get_param("FABRIC_CLIENT_ID",     CRM_CLIENT_ID)
+ONELAKE_CLIENT_SECRET = _get_param_b64("FABRIC_CLIENT_SECRET_B64") or _get_param("FABRIC_CLIENT_SECRET") or CRM_CLIENT_SECRET
 
 # Validazione parametri obbligatori
 _required = {
-    "BC_TENANT_ID": BC_TENANT_ID,
-    "BC_CLIENT_ID": BC_CLIENT_ID,
-    "BC_CLIENT_SECRET": BC_CLIENT_SECRET,
-    "FABRIC_WORKSPACE_ID": WORKSPACE_ID,
-    "FABRIC_LAKEHOUSE_ID": LAKEHOUSE_ID,
+    "CRM_TENANT_ID":        CRM_TENANT_ID,
+    "CRM_CLIENT_ID":        CRM_CLIENT_ID,
+    "CRM_CLIENT_SECRET":    CRM_CLIENT_SECRET,
+    "CRM_ORG_URL":          CRM_ORG_URL,
+    "FABRIC_WORKSPACE_ID":  WORKSPACE_ID,
+    "FABRIC_LAKEHOUSE_ID":  LAKEHOUSE_ID,
     "FABRIC_MIRRORED_DB_ID": MIRRORED_DB_ID,
 }
 _missing = [k for k, v in _required.items() if not v]
@@ -86,10 +89,13 @@ if _missing:
         f"Passarli come --KEY value nello Spark Job o come variabili d'ambiente."
     )
 
-STATE_FILE = f"{LAKEHOUSE_ID}/Files/MirroringState/.mirroring_state.json"
+STATE_FILE = f"{LAKEHOUSE_ID}/Files/MirroringState/.crm_mirroring_state.json"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_FACTOR = 1
+
+# Dataverse ha un page size max di 5000 record per pagina
+CRM_PAGE_SIZE = 5000
 
 # ================= ONELAKE HELPERS =================
 
@@ -124,27 +130,27 @@ def save_state(state):
     except Exception as e:
         print(f"[WARN] Impossibile salvare stato: {e}")
 
-def get_last_load_timestamp(company, entity):
+def get_last_load_timestamp(entity):
     state = load_state()
-    key = f"{company}::{entity}"
+    key = f"CRM::{entity}"
     return state.get(key, {}).get("last_load", None)
 
-def update_load_timestamp(company, entity, timestamp):
+def update_load_timestamp(entity, timestamp):
     state = load_state()
-    key = f"{company}::{entity}"
+    key = f"CRM::{entity}"
     if key not in state:
         state[key] = {}
     state[key]["last_load"] = timestamp
     save_state(state)
 
-def get_next_file_sequence(company, entity):
+def get_next_file_sequence(entity):
     state = load_state()
-    key = f"{company}::{entity}"
+    key = f"CRM::{entity}"
     return state.get(key, {}).get("next_sequence", 1)
 
-def update_file_sequence(company, entity, sequence):
+def update_file_sequence(entity, sequence):
     state = load_state()
-    key = f"{company}::{entity}"
+    key = f"CRM::{entity}"
     if key not in state:
         state[key] = {}
     state[key]["next_sequence"] = sequence + 1
@@ -153,10 +159,6 @@ def update_file_sequence(company, entity, sequence):
 # ================= DATA HELPERS =================
 
 def add_row_marker_column(df, mode=None, is_incremental=None, key_columns=None, keep_data_for_delete=False):
-    """
-    Aggiunge la colonna __rowMarker__ per Open Mirroring.
-    0=Insert, 1=Update, 2=Delete, 4=Upsert
-    """
     mapper = {'insert': 0, 'update': 1, 'delete': 2, 'upsert': 4}
 
     if mode is None:
@@ -229,24 +231,23 @@ def sanitize_dataframe(df):
 
 # ================= KEYS MANAGEMENT =================
 
-def _keys_file_path(company, entity):
-    safe_company = re.sub(r'[^a-zA-Z0-9_-]', '_', company)
+def _keys_file_path(entity):
     safe_entity = re.sub(r'[^a-zA-Z0-9_-]', '_', entity)
-    return f"{LAKEHOUSE_ID}/{KEYS_TARGET_FOLDER}/{safe_company}/{safe_entity}/keys.csv"
+    return f"{LAKEHOUSE_ID}/{KEYS_TARGET_FOLDER}/CRM/{safe_entity}/keys.csv"
 
-def load_previous_keys(company, entity):
+def load_previous_keys(entity):
     try:
         client = _get_onelake_client().get_file_system_client(WORKSPACE_ID)
-        data = client.get_file_client(_keys_file_path(company, entity)).download_file().readall()
+        data = client.get_file_client(_keys_file_path(entity)).download_file().readall()
         return pd.read_csv(pd.io.common.BytesIO(data), dtype=str)
     except Exception:
         return None
 
-def save_current_keys(df_keys, company, entity):
+def save_current_keys(df_keys, entity):
     try:
         client = _get_onelake_client().get_file_system_client(WORKSPACE_ID)
         keys_bytes = df_keys.to_csv(index=False).encode('utf-8')
-        client.get_file_client(_keys_file_path(company, entity)).upload_data(keys_bytes, overwrite=True)
+        client.get_file_client(_keys_file_path(entity)).upload_data(keys_bytes, overwrite=True)
     except Exception as e:
         raise Exception(f"Impossibile salvare chiavi su OneLake: {e}")
 
@@ -254,7 +255,10 @@ def save_current_keys(df_keys, company, entity):
 
 def create_openmirroring_metadata(df, key_columns=None):
     if key_columns is None:
-        if "id" in [col.lower() for col in df.columns]:
+        id_cols = [c for c in df.columns if c.lower().endswith('id') and 'odata' not in c.lower()]
+        if id_cols:
+            key_columns = [id_cols[0]]
+        elif "id" in [col.lower() for col in df.columns]:
             key_columns = ["id"]
         else:
             key_columns = [df.columns[0]]
@@ -285,39 +289,47 @@ def create_openmirroring_metadata(df, key_columns=None):
         "fileFormat": "csv"
     }
 
-def create_partner_events(company, entity):
+def create_partner_events(entity):
     return {
-        "partnerName": "BusinessCentralMirroring",
+        "partnerName": "DataverseMirroring",
         "sourceInfo": {
-            "sourceType": "DynamicsBC",
-            "sourceVersion": "21.0",
+            "sourceType": "Dataverse",
+            "sourceVersion": CRM_API_VERSION,
             "additionalInformation": {
-                "environment": ENVIRONMENT,
-                "company": company,
+                "orgUrl": CRM_ORG_URL,
                 "entity": entity,
                 "createdAt": datetime.now().isoformat()
             }
         }
     }
 
-# ================= BC API =================
+# ================= CRM / DATAVERSE API =================
 
-def get_bc_token():
+def get_crm_token():
     credential = ClientSecretCredential(
-        tenant_id=BC_TENANT_ID,
-        client_id=BC_CLIENT_ID,
-        client_secret=BC_CLIENT_SECRET
+        tenant_id=CRM_TENANT_ID,
+        client_id=CRM_CLIENT_ID,
+        client_secret=CRM_CLIENT_SECRET
     )
-    token = credential.get_token("https://api.businesscentral.dynamics.com/.default")
+    # Normalizza URL: aggiunge https:// se mancante
+    org_url = CRM_ORG_URL.strip()
+    if not org_url.startswith("https://") and not org_url.startswith("http://"):
+        org_url = f"https://{org_url}"
+    scope = f"{org_url}/.default"
+    print(f"[AUTH] Scope usato: {scope}") 
+    token = credential.get_token(scope)
     return token.token
 
-def pull_full_data(token, company, entity, last_load_timestamp=None, mode=None, delete_keys=None, key_columns=None, keep_data_for_delete=False):
-    base_url = (
-        f"https://api.businesscentral.dynamics.com/"
-        f"v2.0/{BC_TENANT_ID}/{ENVIRONMENT}/ODataV4/"
-        f"Company('{company}')/{entity}"
-    )
-    headers = {"Authorization": f"Bearer {token}"}
+
+def pull_crm_data(token, entity, last_load_timestamp=None, mode=None, delete_keys=None, key_columns=None, keep_data_for_delete=False):
+    base_url = f"{CRM_ORG_URL}/api/data/{CRM_API_VERSION}/{entity}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+        "Prefer": f"odata.maxpagesize={CRM_PAGE_SIZE}"
+    }
     rows = []
     session = get_session_with_retries()
 
@@ -347,26 +359,43 @@ def pull_full_data(token, company, entity, last_load_timestamp=None, mode=None, 
                 filter_date = str(last_load_timestamp)
                 if not filter_date.endswith('Z'):
                     filter_date = filter_date.rstrip() + "Z"
-            filter_query = f"?$filter=SystemModifiedAt gt datetime'{filter_date}'"
+            filter_query = f"?$filter=modifiedon gt {filter_date}"
             url_with_filter = base_url + filter_query
-            print(f"  [INCREMENTAL] SystemModifiedAt > {filter_date}")
+            print(f"  [INCREMENTAL] modifiedon > {filter_date}")
         else:
             url_with_filter = base_url
 
         pagination_url = url_with_filter
         retry_without_filter = False
+        page_count = 0
+
         while pagination_url:
             try:
-                response = session.get(pagination_url, headers=headers, timeout=30)
+                response = session.get(pagination_url, headers=headers, timeout=60)
+
                 if response.status_code == 400 and is_incremental and not retry_without_filter:
                     print("  [WARN] Filtro fallito (400), retry senza filtro...")
                     retry_without_filter = True
-                    pagination_url = base_url
+                    pagination_url = url_with_filter = base_url
                     continue
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 30))
+                    print(f"  [THROTTLE] Rate limited. Attesa {retry_after}s...")
+                    sleep(retry_after)
+                    continue
+
                 response.raise_for_status()
                 data = response.json()
-                rows.extend(data.get("value", []))
+                batch = data.get("value", [])
+                rows.extend(batch)
+                page_count += 1
+
+                if page_count % 10 == 0:
+                    print(f"  [PAGING] Pagina {page_count}, {len(rows)} righe totali...")
+
                 pagination_url = data.get("@odata.nextLink")
+
             except Exception as e:
                 if "400" in str(e) and is_incremental and not retry_without_filter:
                     print("  [WARN] Filtro fallito, retry senza filtro...")
@@ -379,7 +408,7 @@ def pull_full_data(token, company, entity, last_load_timestamp=None, mode=None, 
         session.close()
 
     if not rows:
-        print(f"  [WARN] Nessun dato trovato per {company}::{entity}")
+        print(f"  [WARN] Nessun dato trovato per CRM::{entity}")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
@@ -387,6 +416,10 @@ def pull_full_data(token, company, entity, last_load_timestamp=None, mode=None, 
     odata_cols = [col for col in df.columns if col.startswith('@')]
     if odata_cols:
         df = df.drop(columns=odata_cols)
+
+    nav_annotation_cols = [col for col in df.columns if '@' in col]
+    if nav_annotation_cols:
+        df = df.drop(columns=nav_annotation_cols)
 
     df = df.dropna(axis=1, how='all')
     df = sanitize_dataframe(df)
@@ -421,38 +454,34 @@ def validate_dataframe_for_mirroring(df):
 
 # ================= UPLOAD =================
 
-def upload_to_onelake(df, company, entity, metadata_override=None):
+def upload_to_onelake(df, entity, metadata_override=None):
     table_name = entity
     is_valid, validation_warnings = validate_dataframe_for_mirroring(df)
     for w in validation_warnings:
         print(f"  {w}")
 
-    next_sequence = get_next_file_sequence(company, entity)
+    next_sequence = get_next_file_sequence(entity)
     data_file_name = f"{next_sequence:020d}.csv"
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"  [UPLOAD] Tentativo {attempt} | {company}::{entity} | File: {data_file_name} | Righe: {len(df)}")
+            print(f"  [UPLOAD] Tentativo {attempt} | CRM::{entity} | File: {data_file_name} | Righe: {len(df)}")
 
             client = _get_onelake_client().get_file_system_client(WORKSPACE_ID)
             table_folder = f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/{table_name}"
 
-            # 1. CSV
             csv_bytes = df.to_csv(index=False, encoding='utf-8', quoting=1, lineterminator='\r\n').encode('utf-8')
             client.get_file_client(f"{table_folder}/{data_file_name}").upload_data(csv_bytes, overwrite=True)
 
-            # 2. _metadata.json
             metadata = metadata_override if metadata_override else create_openmirroring_metadata(df)
             metadata_bytes = json.dumps(metadata, indent=2).encode('utf-8')
             client.get_file_client(f"{table_folder}/_metadata.json").upload_data(metadata_bytes, overwrite=True)
 
-            # 3. _partnerEvents.json
-            pe_bytes = json.dumps(create_partner_events(company, entity), indent=2).encode('utf-8')
+            pe_bytes = json.dumps(create_partner_events(entity), indent=2).encode('utf-8')
             client.get_file_client(f"{MIRRORED_DB_ID}/{TARGET_FOLDER}/_partnerEvents.json").upload_data(pe_bytes, overwrite=True)
 
-            # 4. Aggiorna stato
-            update_file_sequence(company, entity, next_sequence)
-            update_load_timestamp(company, entity, datetime.now())
+            update_file_sequence(entity, next_sequence)
+            update_load_timestamp(entity, datetime.now())
 
             print(f"  [OK] Upload completato: {data_file_name} ({len(csv_bytes)} bytes, {len(df)} righe)")
             return True
@@ -481,70 +510,65 @@ if __name__ == "__main__":
         pass
 
     try:
-        print(f"[START] BC -> OneLake | Companies: {COMPANIES} | Entities: {ENTITIES}")
+        print(f"[START] CRM/Dataverse -> OneLake | Org: {CRM_ORG_URL} | Entities: {ENTITIES}")
 
-        print("[AUTH] Autenticazione BC...")
-        token = get_bc_token()
+        print("[AUTH] Autenticazione Dataverse...")
+        token = get_crm_token()
         print("[AUTH] Token ottenuto")
 
         total_uploaded = 0
-        failed_combinations = []
+        failed_entities = []
 
-        for company in COMPANIES:
-            for entity in ENTITIES:
-                print(f"\n[PROCESS] {company} :: {entity}")
+        for entity in ENTITIES:
+            print(f"\n[PROCESS] CRM :: {entity}")
+
+            try:
+                last_load = get_last_load_timestamp(entity)
+                is_incremental = last_load is not None
+
+                if is_incremental:
+                    print(f"  [MODE] INCREMENTAL (ultimo carico: {last_load})")
+                else:
+                    print(f"  [MODE] INITIAL LOAD")
+
+                df = pull_crm_data(token, entity, last_load)
+
+                if df.empty:
+                    print("  [SKIP] Nessun dato trovato")
+                    continue
+
+                metadata = create_openmirroring_metadata(df)
+                key_columns = metadata.get('keyColumns', [df.columns[0]])
+
+                current_keys_df = df.loc[:, key_columns].drop_duplicates().astype(str).reset_index(drop=True)
+
+                prev_keys_df = load_previous_keys(entity)
+                if prev_keys_df is not None:
+                    prev = prev_keys_df.astype(str)
+                    merged = prev.merge(current_keys_df, on=key_columns, how='left', indicator=True)
+                    deleted_keys_df = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+                    if not deleted_keys_df.empty:
+                        print(f"  [DELETE] {len(deleted_keys_df)} righe da eliminare")
+                        delete_df = add_row_marker_column(deleted_keys_df, mode='delete', key_columns=key_columns, keep_data_for_delete=False)
+                        metadata_delete = create_openmirroring_metadata(deleted_keys_df, key_columns=key_columns)
+                        upload_to_onelake(delete_df, entity, metadata_override=metadata_delete)
+
+                upload_to_onelake(df, entity)
+                total_uploaded += 1
 
                 try:
-                    last_load = get_last_load_timestamp(company, entity)
-                    is_incremental = last_load is not None
-
-                    if is_incremental:
-                        print(f"  [MODE] INCREMENTAL (ultimo carico: {last_load})")
-                    else:
-                        print(f"  [MODE] INITIAL LOAD")
-
-                    df = pull_full_data(token, company, entity, last_load)
-
-                    if df.empty:
-                        print("  [SKIP] Nessun dato trovato")
-                        continue
-
-                    metadata = create_openmirroring_metadata(df)
-                    key_columns = metadata.get('keyColumns', [df.columns[0]])
-
-                    current_keys_df = df.loc[:, key_columns].drop_duplicates().astype(str).reset_index(drop=True)
-
-                    # Rileva delete
-                    prev_keys_df = load_previous_keys(company, entity)
-                    if prev_keys_df is not None:
-                        prev = prev_keys_df.astype(str)
-                        merged = prev.merge(current_keys_df, on=key_columns, how='left', indicator=True)
-                        deleted_keys_df = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
-                        if not deleted_keys_df.empty:
-                            print(f"  [DELETE] {len(deleted_keys_df)} righe da eliminare")
-                            delete_df = add_row_marker_column(deleted_keys_df, mode='delete', key_columns=key_columns, keep_data_for_delete=False)
-                            metadata_delete = create_openmirroring_metadata(deleted_keys_df, key_columns=key_columns)
-                            upload_to_onelake(delete_df, company, entity, metadata_override=metadata_delete)
-
-                    # Upload dati
-                    upload_to_onelake(df, company, entity)
-
-                    total_uploaded += 1
-
-                    # Salva chiavi per prossimo run
-                    try:
-                        save_current_keys(current_keys_df, company, entity)
-                    except Exception as e:
-                        print(f"  [WARN] Impossibile salvare chiavi: {e}")
-
+                    save_current_keys(current_keys_df, entity)
                 except Exception as e:
-                    print(f"  [ERROR] {company}::{entity} - {str(e)}")
-                    failed_combinations.append(f"{company}::{entity}")
-                    traceback.print_exc()
+                    print(f"  [WARN] Impossibile salvare chiavi: {e}")
+
+            except Exception as e:
+                print(f"  [ERROR] CRM::{entity} - {str(e)}")
+                failed_entities.append(entity)
+                traceback.print_exc()
 
         print(f"\n[DONE] Upload riusciti: {total_uploaded}")
-        if failed_combinations:
-            print(f"[DONE] Falliti: {len(failed_combinations)} -> {failed_combinations}")
+        if failed_entities:
+            print(f"[DONE] Falliti: {len(failed_entities)} -> {failed_entities}")
 
     except Exception as e:
         print(f"[FATAL] {str(e)}")
