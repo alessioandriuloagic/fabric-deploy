@@ -199,6 +199,18 @@ function Get-OrCreate-MirroringDb {
     return $mirroringId
 }
 
+function Start-Mirroring {
+    param([string]$WorkspaceId, [string]$MirroringId, [hashtable]$Headers, [string]$BaseUrl)
+    $url = "$BaseUrl/mirroredDatabases/$MirroringId/startMirroring"
+    Write-Host "  Avvio mirroring (POST $url)..."
+    try {
+        Invoke-FabricApi -Method POST -Url $url -Headers $Headers | Out-Null
+        Write-Host "  [OK] Mirroring avviato."
+    } catch {
+        Write-Host "  [WARN] startMirroring ha restituito un errore (potrebbe essere gia in esecuzione): $_"
+    }
+}
+
 function Deploy-SparkJob {
     param([string]$SparkJobName, [string]$PythonFileName, [string]$LakehouseId,
           [string]$Description, [hashtable]$Headers, [string]$BaseUrl)
@@ -416,6 +428,7 @@ if ($connectorList -contains "BC") {
     $mirroringId = ([string](Get-OrCreate-MirroringDb `
         -DisplayName $BcMirroringDbName -Description "Open Mirroring - BC" `
         -Headers $headers -BaseUrl $baseUrl)).Trim()
+    Start-Mirroring -WorkspaceId $WorkspaceId -MirroringId $mirroringId -Headers $headers -BaseUrl $baseUrl
 
     Write-Host ""
     Write-Host "=== BC STEP 3: Spark Job ==="
@@ -476,6 +489,7 @@ if ($connectorList -contains "CRM") {
     $mirroringId = ([string](Get-OrCreate-MirroringDb `
         -DisplayName $CrmMirroringDbName -Description "Open Mirroring - CRM" `
         -Headers $headers -BaseUrl $baseUrl)).Trim()
+    Start-Mirroring -WorkspaceId $WorkspaceId -MirroringId $mirroringId -Headers $headers -BaseUrl $baseUrl
 
     Write-Host ""
     Write-Host "=== CRM STEP 3: Spark Job ==="
