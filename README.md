@@ -2,14 +2,19 @@
 
 ## Architettura
 
-Soluzione modulare per pubblicare item Fabric per cliente, tramite **GitHub Actions**.
+Soluzione modulare **multi-cliente** per pubblicare item Fabric, tramite **GitHub Actions**.
+Ogni cliente corrisponde a un **GitHub Environment** che contiene i propri secret/variabili
+(Fabric + connettori). Aggiungere un cliente nuovo = creare un nuovo Environment, **senza
+modificare il workflow**.
 
 ```
 Repository
 ├── .github/workflows/
-│   └── deploy.yml               # Pipeline GitHub Actions (workflow_dispatch)
+│   └── deploy.yml               # Pipeline GitHub Actions (workflow_dispatch, input: client)
 ├── scripts/
-│   └── deploy.ps1               # Deploy modulare (flag -Connectors "BC,CRM")
+│   ├── deploy.ps1               # Deploy modulare (flag -Connectors "BC,CRM")
+│   ├── new-client.ps1           # Onboarding cliente (crea Environment + secret/var) [una tantum]
+│   └── deploy-wizard.ps1        # Wizard: sceglie cliente+connettori e avvia l'Action
 └── python/
     └── bc_sync.py               # Connettore Business Central
 ```
@@ -33,6 +38,36 @@ Ogni connettore crea item Fabric distinti:
 
 ---
 
+## Flusso multi-cliente
+
+Ogni cliente = un **GitHub Environment** (es. `cliente-x`, `cliente-y`). Il workflow riceve
+il nome del cliente come input `client` e usa l'Environment omonimo per leggere secret/variabili.
+
+```mermaid
+flowchart LR
+    W[deploy-wizard.ps1<br/>scelta cliente+connettori] -->|gh workflow run| A[GitHub Actions<br/>deploy.yml]
+    N[new-client.ps1<br/>onboarding] -->|gh secret/variable set| E[(GitHub Environments<br/>cliente-x / cliente-y / ...)]
+    A -->|environment = client| E
+    A --> P[deploy.ps1 -> Fabric]
+```
+
+**Workflow tipico:**
+
+1. **Onboarding** (una tantum per cliente) — `new-client.ps1` crea l'Environment e imposta
+   credenziali Fabric + parametri connettori. È l'unico passo manuale, ed è guidato.
+2. **Deploy** (ogni volta) — `deploy-wizard.ps1` legge gli Environment esistenti, fa scegliere
+   cliente + connettori e lancia automaticamente la GitHub Action.
+
+---
+
+## Prerequisiti
+
+- [GitHub CLI](https://cli.github.com/) installata: `winget install GitHub.cli`
+- Autenticazione (scope `repo`): `gh auth login`
+- Eseguire gli script dalla root del repo (oppure passare `-Repo owner/repo`)
+
+---
+
 ## Flag `connectors`
 
 Workflow input `connectors`:
@@ -43,13 +78,46 @@ Workflow input `connectors`:
 
 ---
 
-## Setup GitHub Actions
+## Onboarding di un nuovo cliente
 
-### 1. Crea GitHub Environment (`dev`, `prod`)
+Crea l'Environment e configura secret/variabili. **Una tantum per cliente.**
 
-`Settings → Environments → New environment`
+```powershell
+# Interattivo (chiede i valori; i secret in input nascosto)
+.\scripts\new-client.ps1 -Client cliente-x -Connectors BC
 
-Per ognuno, aggiungi le variabili/secret:
+# Non interattivo (BC + CRM)
+.\scripts\new-client.ps1 -Client cliente-x -Connectors "BC,CRM" `
+  -FabricTenantId "..." -FabricClientId "..." -FabricClientSecret "..." `
+  -FabricWorkspaceId "..." `
+  -BcTenantId "..." -BcEnvironment "Production" `
+  -BcCompanies "CRONUS IT" -BcEntities "ItemLedgerEntries,Customers" `
+  -CrmOrgUrl "https://contoso.crm4.dynamics.com" `
+  -CrmEntities "account,contact,opportunity"
+```
+
+Lo script imposta automaticamente i secret/variabili descritti nella sezione successiva.
+
+---
+
+## Avvio del deploy (wizard)
+
+```powershell
+# Wizard interattivo: scegli cliente + connettori da menu
+.\scripts\deploy-wizard.ps1
+
+# Diretto, e segui l'esecuzione del run
+.\scripts\deploy-wizard.ps1 -Client cliente-x -Connectors BC -Watch
+```
+
+Il wizard usa `gh workflow run` per avviare l'Action `Fabric Deploy` sull'Environment del cliente.
+
+---
+
+## Setup GitHub Actions (riferimento variabili)
+
+Le variabili sotto vengono normalmente impostate da `new-client.ps1`. Sezione di
+riferimento se vuoi configurarle a mano da `Settings → Environments → [cliente] → Add secret / variable`.
 
 **Sempre obbligatorie (Fabric):**
 | Nome | Tipo | Descrizione |
@@ -78,7 +146,7 @@ Per ognuno, aggiungi le variabili/secret:
 | `CRM_CLIENT_SECRET` | secret *(opz.)* | Default = `FABRIC_CLIENT_SECRET` |
 | `CRM_CONNECTION_NAME` | variable *(opz.)* | Default = `Dataverse-<host>` |
 
-### 2. Service Principal: permessi richiesti
+### Service Principal: permessi richiesti
 
 **Per Fabric:**
 - Workspace Admin/Member sul workspace target
@@ -89,7 +157,7 @@ Per ognuno, aggiungi le variabili/secret:
 - In *Power Platform Admin Center → Environment → Settings → Users*: aggiungere
   l'app come **Application User** con Security Role di lettura sulle entità
 
-### 3. Prerequisito Dataverse: "Link to Microsoft Fabric"
+### Prerequisito Dataverse: "Link to Microsoft Fabric"
 
 Lo shortcut Dataverse richiede che l'environment Dataverse abbia abilitato il
 feature **Link to Microsoft Fabric** (Power Apps Maker → Tables → Link to
@@ -98,10 +166,16 @@ rendendole indirizzabili come shortcut.
 
 > Operazione *una tantum* da fare manualmente lato Dataverse.
 
-### 4. Trigger workflow
+### Trigger workflow
 
-`Actions → Fabric Deploy → Run workflow` con i parametri:
-- `targetEnvironment`: `dev` | `prod`
+**Consigliato:** usa il wizard (vedi sezione *Avvio del deploy*):
+
+```powershell
+.\scripts\deploy-wizard.ps1 -Client cliente-x
+```
+
+**In alternativa**, manualmente da GitHub: `Actions → Fabric Deploy → Run workflow` con i parametri:
+- `client`: nome del cliente (= GitHub Environment, es. `cliente-x`)
 - `connectors`: `BC` | `CRM` | `BC,CRM`
 - `forceRecreate`: ricreazione pipeline (utile in caso di definition cache)
 

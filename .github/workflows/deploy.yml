@@ -36,14 +36,11 @@ name: Fabric Deploy
 on:
   workflow_dispatch:
     inputs:
-      targetEnvironment:
-        description: "Workspace target"
-        type: choice
+      client:
+        description: "Cliente target (= nome GitHub Environment, es. cliente-x)"
+        type: string
         required: true
         default: dev
-        options:
-          - dev
-          - prod
       connectors:
         description: "Connettori da installare"
         type: choice
@@ -61,9 +58,9 @@ on:
 
 jobs:
   deploy:
-    name: "Deploy Fabric [${{ inputs.connectors }}] -> ${{ inputs.targetEnvironment }}"
+    name: "Deploy Fabric [${{ inputs.connectors }}] -> ${{ inputs.client }}"
     runs-on: windows-latest
-    environment: ${{ inputs.targetEnvironment }}
+    environment: ${{ inputs.client }}
 
     env:
       # Fabric (sempre richiesti)
@@ -125,7 +122,7 @@ jobs:
           foreach ($item in $required) {
             $v = $item.Name; $val = $item.Val
             if ([string]::IsNullOrEmpty($val)) {
-              Write-Host "::error::Variabile mancante: $v (aggiungerla all'environment '${{ inputs.targetEnvironment }}')"
+              Write-Host "::error::Variabile mancante: $v (aggiungerla all'environment '${{ inputs.client }}')"
               $ok = $false
             } else {
               if ($v -like "*SECRET*") {
