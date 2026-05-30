@@ -25,17 +25,15 @@ param(
     [string]$CrmClientId    = "",
     [string]$CrmClientSecret = "",
     [string]$CrmOrgUrl      = "",
+    [string]$CrmEnvironmentDomain = "",
     [string]$CrmApiVersion  = "v9.2",
-    [string]$CrmEntities    = 'accounts',
-    [string]$CrmPythonFile  = "crm_sync.py",
+    [string]$CrmEntities    = 'msdynmkt_email,msdynmkt_journey,contact',
+    [string]$CrmConnectionName = "",
 
     [string]$LakehouseName      = "LH_Bronze",
     [string]$BcMirroringDbName  = "MirrorDB_BC",
     [string]$BcSparkJobName     = "SJD_BC_Sync",
     [string]$BcPipelineName     = "DP_BC_Sync",
-    [string]$CrmMirroringDbName = "MirrorDB_CRM",
-    [string]$CrmSparkJobName    = "SJD_CRM_Sync",
-    [string]$CrmPipelineName    = "DP_CRM_Sync",
 
     [string]$PythonFileName = ""
 )
@@ -104,6 +102,16 @@ foreach ($conn in $connectorList) {
             if ([string]::IsNullOrEmpty($CrmTenantId) -or $CrmTenantId -eq "")    { $CrmTenantId    = $TenantId }
             if ([string]::IsNullOrEmpty($CrmClientId) -or $CrmClientId -eq "")    { $CrmClientId    = $ClientId }
             if ([string]::IsNullOrEmpty($CrmClientSecret) -or $CrmClientSecret -eq ""){ $CrmClientSecret = $ClientSecret }
+
+            # Default environment domain = CrmOrgUrl
+            if ([string]::IsNullOrEmpty($CrmEnvironmentDomain) -or $CrmEnvironmentDomain -eq "") {
+                $CrmEnvironmentDomain = $CrmOrgUrl
+            }
+            # Default connection name
+            if ([string]::IsNullOrEmpty($CrmConnectionName) -or $CrmConnectionName -eq "") {
+                $hostOnly = $CrmEnvironmentDomain -replace '^https?://','' -replace '/.*$',''
+                $CrmConnectionName = "Dataverse-$hostOnly"
+            }
         }
         default { Write-Host "##[error] Connettore sconosciuto: $conn"; exit 1 }
     }
@@ -400,6 +408,123 @@ function Assert-SparkArgsSafe([string]$SparkArgs, [string]$ConnectorName) {
 }
 
 # ─────────────────────────────────────────
+# DATAVERSE: Connection + Shortcut helpers
+# ─────────────────────────────────────────
+
+# Cerca una Fabric Connection per displayName. Restituisce l'id o $null.
+function Find-FabricConnection {
+    param([string]$DisplayName, [hashtable]$Headers)
+    try {
+        $resp = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/connections" -Headers $Headers -Method GET
+        $match = $resp.value | Where-Object { $_.displayName -eq $DisplayName }
+        if ($match) { return $match.id }
+    } catch {
+        Write-Host "  [WARN] Lookup connections fallito: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+# Crea (o riusa) una Fabric Connection di tipo Dataverse autenticata con Service Principal.
+function Get-OrCreate-DataverseConnection {
+    param(
+        [string]$DisplayName,
+        [string]$EnvironmentDomain,
+        [string]$DvTenantId,
+        [string]$DvClientId,
+        [string]$DvClientSecret,
+        [hashtable]$Headers
+    )
+
+    $existingId = Find-FabricConnection -DisplayName $DisplayName -Headers $Headers
+    if ($existingId) {
+        Write-Host "  [OK] Connection Dataverse '$DisplayName' gia esistente - ID: $existingId"
+        return $existingId
+    }
+
+    Write-Host "  [NEW] Creo Connection Dataverse '$DisplayName'..."
+    $body = @{
+        connectivityType = "ShareableCloud"
+        displayName      = $DisplayName
+        connectionDetails = @{
+            type           = "Dataverse"
+            creationMethod = "Dataverse"
+            parameters = @(
+                @{ dataType = "Text"; name = "environmentDomain"; value = $EnvironmentDomain }
+            )
+        }
+        privacyLevel = "Organizational"
+        credentialDetails = @{
+            singleSignOnType     = "None"
+            connectionEncryption = "NotEncrypted"
+            skipTestConnection   = $false
+            credentials = @{
+                credentialType            = "ServicePrincipal"
+                tenantId                  = $DvTenantId
+                servicePrincipalClientId  = $DvClientId
+                servicePrincipalSecret    = $DvClientSecret
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $result = Invoke-FabricApi -Method POST -Url "https://api.fabric.microsoft.com/v1/connections" -Headers $Headers -Body $body
+    $connId = $result.id
+    if ([string]::IsNullOrWhiteSpace($connId)) {
+        Start-Sleep -Seconds 3
+        $connId = Find-FabricConnection -DisplayName $DisplayName -Headers $Headers
+    }
+    Write-Host "  [OK] Connection creata - ID: $connId"
+    return $connId
+}
+
+# Crea (idempotente) uno shortcut Dataverse nel Lakehouse, sotto Tables/<entity>.
+function New-DataverseShortcut {
+    param(
+        [string]$WorkspaceId,
+        [string]$LakehouseId,
+        [string]$ConnectionId,
+        [string]$EnvironmentDomain,
+        [string]$TableName,
+        [hashtable]$Headers
+    )
+
+    $shortcutsUrl = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/items/$LakehouseId/shortcuts"
+
+    # Verifica se esiste gia (GET Tables/<name>)
+    try {
+        $existing = Invoke-RestMethod -Uri "$shortcutsUrl/Tables/$TableName" -Headers $Headers -Method GET -ErrorAction Stop
+        if ($existing) {
+            Write-Host "  [OK] Shortcut Dataverse 'Tables/$TableName' gia esistente"
+            return
+        }
+    } catch {
+        # 404 atteso se non esiste -> procedo a creare
+    }
+
+    $body = @{
+        name = $TableName
+        path = "Tables"
+        target = @{
+            type = "Dataverse"
+            dataverse = @{
+                connectionId      = $ConnectionId
+                environmentDomain = $EnvironmentDomain
+                tableName         = $TableName
+                deltaLakeFolder   = $TableName
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Write-Host "  [NEW] Creo shortcut Dataverse 'Tables/$TableName'..."
+    try {
+        Invoke-FabricApi -Method POST -Url $shortcutsUrl -Headers $Headers -Body $body | Out-Null
+        Write-Host "  [OK] Shortcut 'Tables/$TableName' creato"
+    } catch {
+        Write-Host "##[error] Errore creazione shortcut '$TableName': $($_.Exception.Message)"
+        throw
+    }
+}
+
+# ─────────────────────────────────────────
 # 0. AUTENTICAZIONE
 # ─────────────────────────────────────────
 Write-Host ""
@@ -441,7 +566,7 @@ Write-Host "  Lakehouse ID: $lakehouseId"
 
 Write-Host ""
 Write-Host "=== STEP 1b: Struttura Cartelle ==="
-foreach ($f in @("Files/BC","Files/BC/Scripts","Files/CRM","Files/CRM/Scripts",
+foreach ($f in @("Files/BC","Files/BC/Scripts",
                  "Files/Orchestration","Files/MirroringState","Files/MirroringKeys")) {
     Ensure-LakehouseFolder -FolderPath $f -DfsToken $onelakeToken -WsId $WorkspaceId -LhId $lakehouseId
 }
@@ -508,63 +633,57 @@ if ($connectorList -contains "BC") {
 }
 
 # =========================================================
-# DEPLOY CRM
+# DEPLOY CRM (Dataverse shortcuts nel Lakehouse)
 # =========================================================
 if ($connectorList -contains "CRM") {
     Write-Host ""
     Write-Host "####################################################"
-    Write-Host "# DEPLOY: CRM / DATAVERSE"
+    Write-Host "# DEPLOY: CRM / DATAVERSE (Shortcut)"
     Write-Host "####################################################"
 
     Write-Host ""
-    Write-Host "=== CRM STEP 2: Mirroring Database ==="
-    $mirroringId = ([string](Get-OrCreate-MirroringDb `
-        -DisplayName $CrmMirroringDbName -Description "Open Mirroring - CRM" `
-        -Headers $headers -BaseUrl $baseUrl)).Trim()
-    Start-Mirroring -WorkspaceId $WorkspaceId -MirroringId $mirroringId -Headers $headers -BaseUrl $baseUrl
+    Write-Host "=== CRM STEP 2: Connection Dataverse ==="
+    $crmConnectionId = Get-OrCreate-DataverseConnection `
+        -DisplayName $CrmConnectionName `
+        -EnvironmentDomain $CrmEnvironmentDomain `
+        -DvTenantId $CrmTenantId `
+        -DvClientId $CrmClientId `
+        -DvClientSecret $CrmClientSecret `
+        -Headers $headers
+    if ([string]::IsNullOrWhiteSpace($crmConnectionId)) {
+        Write-Host "##[error] Impossibile creare/recuperare Connection Dataverse"; exit 1
+    }
 
     Write-Host ""
-    Write-Host "=== CRM STEP 3: Spark Job ==="
-    $sparkJobId = ([string](Deploy-SparkJob -SparkJobName $CrmSparkJobName `
-        -PythonFileName $CrmPythonFile -LakehouseId $lakehouseId `
-        -Description "Spark Job CRM Sync" -Headers $headers -BaseUrl $baseUrl)).Trim()
+    Write-Host "=== CRM STEP 3: Shortcut entita' ==="
+    # CrmEntities e' un JSON array (normalizzato a inizio script)
+    $entities = ($CrmEntities | ConvertFrom-Json)
+    Write-Host "  Entita' da esporre come shortcut: $($entities -join ', ')"
 
-    Write-Host ""
-    Write-Host "=== CRM STEP 4: Data Pipeline ==="
-    Write-Host "  Spark Job ID: $sparkJobId"
-    Write-Host "  Mirroring ID: $mirroringId"
-    if ([string]::IsNullOrWhiteSpace($sparkJobId)) { Write-Host "##[error] sparkJobId CRM vuoto!"; exit 1 }
+    $shortcutsCreated = @()
+    foreach ($ent in $entities) {
+        $entityName = "$ent".Trim()
+        if ([string]::IsNullOrWhiteSpace($entityName)) { continue }
+        try {
+            New-DataverseShortcut `
+                -WorkspaceId $WorkspaceId `
+                -LakehouseId $lakehouseId `
+                -ConnectionId $crmConnectionId `
+                -EnvironmentDomain $CrmEnvironmentDomain `
+                -TableName $entityName `
+                -Headers $headers
+            $shortcutsCreated += $entityName
+        } catch {
+            Write-Host "##[error] Shortcut '$entityName' fallito: $($_.Exception.Message)"
+        }
+    }
 
-    $sparkArgs = @(
-        "--CRM_TENANT_ID",             $CrmTenantId,
-        "--CRM_CLIENT_ID",             $CrmClientId,
-        "--CRM_CLIENT_SECRET_B64",     (To-Base64 $CrmClientSecret),
-        "--CRM_ORG_URL",               $CrmOrgUrl,
-        "--CRM_API_VERSION",           $CrmApiVersion,
-        "--CRM_ENTITIES_B64",          (To-Base64 $CrmEntities),
-        "--FABRIC_WORKSPACE_ID",       $WorkspaceId,
-        "--FABRIC_LAKEHOUSE_ID",       $lakehouseId,
-        "--FABRIC_MIRRORED_DB_ID",     $mirroringId,
-        "--FABRIC_TENANT_ID",          $TenantId,
-        "--FABRIC_CLIENT_ID",          $ClientId,
-        "--FABRIC_CLIENT_SECRET_B64",  (To-Base64 $ClientSecret)
-    ) -join " "
-
-    Assert-SparkArgsSafe $sparkArgs "CRM"
-
-    $pipelineDefJson = Build-PipelineDefinitionJson `
-        -PipelineName $CrmPipelineName -SparkJobName $CrmSparkJobName `
-        -SparkJobId $sparkJobId -WorkspaceId $WorkspaceId `
-        -LakehouseId $lakehouseId -CommandLineArgs $sparkArgs
-
-    $pipelineId = Deploy-Pipeline -PipelineName $CrmPipelineName `
-        -PipelineDefJson $pipelineDefJson -Description "Pipeline CRM Sync" `
-        -Headers $headers -BaseUrl $baseUrl -Force $ForceRecreate.IsPresent
-
-    $deployedItems["CRM"] = @{ MirroringDb=$mirroringId; SparkJob=$sparkJobId; Pipeline=$pipelineId }
-    Write-Host "##vso[task.setvariable variable=CRM_MIRRORING_ID]$mirroringId"
-    Write-Host "##vso[task.setvariable variable=CRM_SPARK_JOB_ID]$sparkJobId"
-    Write-Host "##vso[task.setvariable variable=CRM_PIPELINE_ID]$pipelineId"
+    $deployedItems["CRM"] = @{
+        ConnectionId = $crmConnectionId
+        Shortcuts    = $shortcutsCreated
+    }
+    Write-Host "##vso[task.setvariable variable=CRM_CONNECTION_ID]$crmConnectionId"
+    Write-Host "CRM_CONNECTION_ID=$crmConnectionId" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 -ErrorAction SilentlyContinue
 }
 
 # ─────────────────────────────────────────
@@ -579,9 +698,14 @@ Write-Host "  Lakehouse : $lakehouseId ($LakehouseName)"
 foreach ($conn in $deployedItems.Keys) {
     $items = $deployedItems[$conn]
     Write-Host "  --- $conn ---"
-    Write-Host "    Mirroring DB: $($items.MirroringDb)"
-    Write-Host "    Spark Job   : $($items.SparkJob)"
-    Write-Host "    Pipeline    : $($items.Pipeline)"
+    if ($conn -eq "CRM") {
+        Write-Host "    Connection  : $($items.ConnectionId)"
+        Write-Host "    Shortcuts   : $($items.Shortcuts -join ', ')"
+    } else {
+        Write-Host "    Mirroring DB: $($items.MirroringDb)"
+        Write-Host "    Spark Job   : $($items.SparkJob)"
+        Write-Host "    Pipeline    : $($items.Pipeline)"
+    }
 }
 Write-Host "============================================"
 Write-Host "##vso[task.setvariable variable=LAKEHOUSE_ID]$lakehouseId"

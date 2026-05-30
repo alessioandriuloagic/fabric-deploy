@@ -1,0 +1,164 @@
+# =============================================================
+# .github/workflows/deploy.yml
+# GitHub Actions - Fabric Data Integration
+#
+# Trigger: manuale (workflow_dispatch)
+#
+# Secrets/Variables: configurati per environment GitHub (dev, prod)
+#   Settings -> Environments -> [dev|prod] -> Add secret / variable
+#
+# Sempre obbligatorie (Fabric):
+#   FABRIC_TENANT_ID       (secret)
+#   FABRIC_CLIENT_ID       (secret)
+#   FABRIC_CLIENT_SECRET   (secret)
+#   FABRIC_WORKSPACE_ID    (var)
+#
+# Se connettore BC:
+#   BC_TENANT_ID           (var)
+#   BC_ENVIRONMENT         (var)
+#   BC_COMPANIES           (var)   es: CRONUS%20IT  (o JSON array)
+#   BC_ENTITIES            (var)   es: ItemLedgerEntries,Customers
+#
+# Se connettore CRM (Dataverse shortcut):
+#   CRM_ORG_URL                (var)   es: https://orgxxx.crm4.dynamics.com
+#   CRM_ENVIRONMENT_DOMAIN     (var)   stesso valore di CRM_ORG_URL (oppure il
+#                                       dominio "environmentDomain" richiesto
+#                                       dallo shortcut Dataverse)
+#   CRM_ENTITIES               (var)   es: account,contact,opportunity
+#                                       (nomi tabella logici Dataverse)
+#   CRM_TENANT_ID              (secret, opzionale - default = FABRIC_TENANT_ID)
+#   CRM_CLIENT_ID              (secret, opzionale - default = FABRIC_CLIENT_ID)
+#   CRM_CLIENT_SECRET          (secret, opzionale - default = FABRIC_CLIENT_SECRET)
+#   CRM_CONNECTION_NAME        (var,    opzionale - default = "Dataverse-<env>")
+# =============================================================
+name: Fabric Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      targetEnvironment:
+        description: "Workspace target"
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - prod
+      connectors:
+        description: "Connettori da installare"
+        type: choice
+        required: true
+        default: BC
+        options:
+          - BC
+          - CRM
+          - BC,CRM
+      forceRecreate:
+        description: "Forza ricreazione pipeline (elimina e ricrea)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  deploy:
+    name: "Deploy Fabric [${{ inputs.connectors }}] -> ${{ inputs.targetEnvironment }}"
+    runs-on: windows-latest
+    environment: ${{ inputs.targetEnvironment }}
+
+    env:
+      # Fabric (sempre richiesti)
+      FABRIC_TENANT_ID:     ${{ secrets.FABRIC_TENANT_ID }}
+      FABRIC_CLIENT_ID:     ${{ secrets.FABRIC_CLIENT_ID }}
+      FABRIC_CLIENT_SECRET: ${{ secrets.FABRIC_CLIENT_SECRET }}
+      FABRIC_WORKSPACE_ID:  ${{ vars.FABRIC_WORKSPACE_ID }}
+
+      # BC
+      BC_TENANT_ID:         ${{ vars.BC_TENANT_ID }}
+      BC_ENVIRONMENT:       ${{ vars.BC_ENVIRONMENT }}
+      BC_COMPANIES:         ${{ vars.BC_COMPANIES }}
+      BC_ENTITIES:          ${{ vars.BC_ENTITIES }}
+
+      # CRM / Dataverse shortcut
+      CRM_ORG_URL:             ${{ vars.CRM_ORG_URL }}
+      CRM_ENVIRONMENT_DOMAIN:  ${{ vars.CRM_ENVIRONMENT_DOMAIN }}
+      CRM_ENTITIES:            ${{ vars.CRM_ENTITIES }}
+      CRM_TENANT_ID:           ${{ secrets.CRM_TENANT_ID }}
+      CRM_CLIENT_ID:           ${{ secrets.CRM_CLIENT_ID }}
+      CRM_CLIENT_SECRET:       ${{ secrets.CRM_CLIENT_SECRET }}
+      CRM_CONNECTION_NAME:     ${{ vars.CRM_CONNECTION_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verifica variabili
+        shell: pwsh
+        run: |
+          $connectors = "${{ inputs.connectors }}".Split(",") | ForEach-Object { $_.Trim().ToUpper() }
+          Write-Host "[CONFIG] Connettori: $($connectors -join ', ')"
+
+          $required = @(
+            @{Name="FABRIC_TENANT_ID";     Val=$env:FABRIC_TENANT_ID},
+            @{Name="FABRIC_CLIENT_ID";     Val=$env:FABRIC_CLIENT_ID},
+            @{Name="FABRIC_CLIENT_SECRET"; Val=$env:FABRIC_CLIENT_SECRET},
+            @{Name="FABRIC_WORKSPACE_ID";  Val=$env:FABRIC_WORKSPACE_ID}
+          )
+
+          if ($connectors -contains "BC") {
+            $required += @(
+              @{Name="BC_TENANT_ID";  Val=$env:BC_TENANT_ID},
+              @{Name="BC_ENVIRONMENT"; Val=$env:BC_ENVIRONMENT},
+              @{Name="BC_COMPANIES";  Val=$env:BC_COMPANIES},
+              @{Name="BC_ENTITIES";   Val=$env:BC_ENTITIES}
+            )
+          }
+
+          if ($connectors -contains "CRM") {
+            $required += @(
+              @{Name="CRM_ORG_URL";            Val=$env:CRM_ORG_URL},
+              @{Name="CRM_ENVIRONMENT_DOMAIN"; Val=$env:CRM_ENVIRONMENT_DOMAIN},
+              @{Name="CRM_ENTITIES";           Val=$env:CRM_ENTITIES}
+            )
+          }
+
+          $ok = $true
+          foreach ($item in $required) {
+            $v = $item.Name; $val = $item.Val
+            if ([string]::IsNullOrEmpty($val)) {
+              Write-Host "::error::Variabile mancante: $v (aggiungerla all'environment '${{ inputs.targetEnvironment }}')"
+              $ok = $false
+            } else {
+              if ($v -like "*SECRET*") {
+                Write-Host "[OK] $v = ********"
+              } else {
+                Write-Host "[OK] $v = $val"
+              }
+            }
+          }
+          if (-not $ok) { exit 1 }
+
+      - name: Deploy Fabric items
+        shell: pwsh
+        run: |
+          $force = "${{ inputs.forceRecreate }}" -eq "true"
+          $params = @{
+            TenantId             = $env:FABRIC_TENANT_ID
+            ClientId             = $env:FABRIC_CLIENT_ID
+            ClientSecret         = $env:FABRIC_CLIENT_SECRET
+            WorkspaceId          = $env:FABRIC_WORKSPACE_ID
+            Connectors           = "${{ inputs.connectors }}"
+            BcTenantId           = $env:BC_TENANT_ID
+            BcEnvironment        = $env:BC_ENVIRONMENT
+            BcCompanies          = $env:BC_COMPANIES
+            BcEntities           = $env:BC_ENTITIES
+            BcPythonFile         = "bc_sync.py"
+            CrmTenantId          = $env:CRM_TENANT_ID
+            CrmClientId          = $env:CRM_CLIENT_ID
+            CrmClientSecret      = $env:CRM_CLIENT_SECRET
+            CrmOrgUrl            = $env:CRM_ORG_URL
+            CrmEnvironmentDomain = $env:CRM_ENVIRONMENT_DOMAIN
+            CrmEntities          = $env:CRM_ENTITIES
+            CrmConnectionName    = $env:CRM_CONNECTION_NAME
+          }
+          if ($force) { $params["ForceRecreate"] = $true }
+          & "${{ github.workspace }}\scripts\deploy.ps1" @params

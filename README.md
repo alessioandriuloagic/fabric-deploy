@@ -2,143 +2,136 @@
 
 ## Architettura
 
-La soluzione supporta **connettori multipli**, ognuno indipendente con i propri item Fabric:
+Soluzione modulare per pubblicare item Fabric per cliente, tramite **GitHub Actions**.
 
 ```
 Repository
-├── azure-pipelines.yml          # Pipeline DevOps con parametro Connectors
+├── .github/workflows/
+│   └── deploy.yml               # Pipeline GitHub Actions (workflow_dispatch)
 ├── scripts/
 │   └── deploy.ps1               # Deploy modulare (flag -Connectors "BC,CRM")
 └── python/
-    ├── bc_sync.py               # Connettore Business Central (esistente)
-    └── crm_sync.py              # Connettore CRM / Dataverse (nuovo)
+    └── bc_sync.py               # Connettore Business Central
 ```
 
-Ogni connettore crea un set isolato di item Fabric:
+Ogni connettore crea item Fabric distinti:
 
-| Item | BC | CRM |
+| Item | BC | CRM (Dataverse) |
 |------|------|------|
-| Lakehouse | `LH_BC_Landing` | `LH_CRM_Landing` |
-| Mirroring DB | `MirrorDB_BC_Landing` | `MirrorDB_CRM_Landing` |
-| Spark Job | `SJD_BC_To_Mirroring` | `SJD_CRM_To_Mirroring` |
-| Pipeline | `DP_BC_To_Mirroring` | `DP_CRM_To_Mirroring` |
+| Lakehouse (condiviso) | `LH_Bronze` | `LH_Bronze` |
+| Mirroring DB | `MirrorDB_BC` | *(N/A - uso shortcut)* |
+| Spark Job | `SJD_BC_Sync` | *(N/A)* |
+| Pipeline | `DP_BC_Sync` | *(N/A)* |
+| Connection Dataverse | *(N/A)* | `Dataverse-<host>` |
+| OneLake Shortcut | *(N/A)* | `LH_Bronze/Tables/<entity>` |
+
+> **CRM**: il deploy crea una **Connection Dataverse** nel tenant Fabric e poi
+> uno **shortcut Dataverse** sotto `Tables/<entityName>` del Lakehouse per
+> ogni entità configurata. Non serve alcun Spark Job: i dati vengono letti
+> direttamente da Dataverse (live, via shortcut) e sono interrogabili
+> immediatamente da SQL endpoint, Notebook, Power BI.
 
 ---
 
-## Come funziona il flag Connectors
+## Flag `connectors`
 
-Nella pipeline DevOps si seleziona quale connettore installare:
+Workflow input `connectors`:
 
-- **`BC`** → installa solo Business Central
-- **`CRM`** → installa solo CRM/Dataverse
-- **`BC,CRM`** → installa entrambi
-
-Il deploy crea solo gli item necessari per i connettori selezionati.
+- `BC` → solo Business Central (Spark Job + Mirroring + Pipeline)
+- `CRM` → solo CRM/Dataverse (Connection + Shortcuts)
+- `BC,CRM` → entrambi
 
 ---
 
-## Setup per nuovo cliente
+## Setup GitHub Actions
 
-### 1. Variable Group in Azure DevOps
+### 1. Crea GitHub Environment (`dev`, `prod`)
 
-Creare il Variable Group `fabric-deploy-<env>` (es: `fabric-deploy-prod`) con:
+`Settings → Environments → New environment`
+
+Per ognuno, aggiungi le variabili/secret:
 
 **Sempre obbligatorie (Fabric):**
-| Variabile | Descrizione |
-|-----------|-------------|
-| `FABRIC_TENANT_ID` | Tenant ID Azure del cliente |
-| `FABRIC_CLIENT_ID` | Client ID Service Principal Fabric |
-| `FABRIC_CLIENT_SECRET` | Client Secret (secret!) |
-| `FABRIC_WORKSPACE_ID` | ID Workspace Fabric target |
+| Nome | Tipo | Descrizione |
+|------|------|-------------|
+| `FABRIC_TENANT_ID` | secret | Tenant ID Azure del cliente |
+| `FABRIC_CLIENT_ID` | secret | Client ID Service Principal Fabric |
+| `FABRIC_CLIENT_SECRET` | secret | Client Secret SP Fabric |
+| `FABRIC_WORKSPACE_ID` | variable | ID Workspace Fabric target |
 
 **Se connettore BC:**
-| Variabile | Descrizione |
-|-----------|-------------|
-| `BC_TENANT_ID` | Tenant ID per Business Central |
-| `BC_ENVIRONMENT` | Nome ambiente BC (es: `Production`) |
-| `BC_COMPANIES` | JSON array aziende (es: `["CRONUS%20IT"]`) |
-| `BC_ENTITIES` | JSON array entità (es: `["ItemLedgerEntries","Customers"]`) |
+| Nome | Tipo | Descrizione |
+|------|------|-------------|
+| `BC_TENANT_ID` | variable | Tenant ID per Business Central |
+| `BC_ENVIRONMENT` | variable | Es: `Production` |
+| `BC_COMPANIES` | variable | Es: `CRONUS%20IT` (o CSV) |
+| `BC_ENTITIES` | variable | Es: `ItemLedgerEntries,Customers` |
 
-**Se connettore CRM:**
-| Variabile | Descrizione |
-|-----------|-------------|
-| `CRM_ORG_URL` | URL organizzazione Dataverse (es: `https://contoso.crm4.dynamics.com`) |
-| `CRM_ENTITIES` | JSON array entity set (es: `["accounts","contacts","opportunities"]`) |
-| `CRM_TENANT_ID` | *(opzionale)* Tenant CRM, default = FABRIC_TENANT_ID |
-| `CRM_CLIENT_ID` | *(opzionale)* Client ID CRM, default = FABRIC_CLIENT_ID |
-| `CRM_CLIENT_SECRET` | *(opzionale)* Secret CRM, default = FABRIC_CLIENT_SECRET |
-| `CRM_API_VERSION` | *(opzionale)* Versione Web API, default = `v9.2` |
+**Se connettore CRM (Dataverse shortcut):**
+| Nome | Tipo | Descrizione |
+|------|------|-------------|
+| `CRM_ORG_URL` | variable | URL Dataverse (es: `https://contoso.crm4.dynamics.com`) |
+| `CRM_ENVIRONMENT_DOMAIN` | variable | Dominio richiesto dallo shortcut (di solito = `CRM_ORG_URL`) |
+| `CRM_ENTITIES` | variable | CSV nomi tabella logici. **Default attuale:** `msdynmkt_email,msdynmkt_journey,contact` |
+| `CRM_TENANT_ID` | secret *(opz.)* | Default = `FABRIC_TENANT_ID` |
+| `CRM_CLIENT_ID` | secret *(opz.)* | Default = `FABRIC_CLIENT_ID` |
+| `CRM_CLIENT_SECRET` | secret *(opz.)* | Default = `FABRIC_CLIENT_SECRET` |
+| `CRM_CONNECTION_NAME` | variable *(opz.)* | Default = `Dataverse-<host>` |
 
-### 2. Azure AD App Registration per CRM
+### 2. Service Principal: permessi richiesti
 
-Il Service Principal deve avere permessi su Dataverse:
+**Per Fabric:**
+- Workspace Admin/Member sul workspace target
+- Permesso di creare Connections (Tenant setting in Fabric Admin Portal)
 
-1. In **Azure Portal → App Registrations** → la tua app
-2. **API Permissions → Add → Dynamics CRM → user_impersonation** (o Application permission)
-3. In **Power Platform Admin Center → Environment → Settings → Users**:
-   - Aggiungere l'app come Application User
-   - Assegnare un Security Role con permessi di lettura sulle entità desiderate
+**Per Dataverse (shortcut):**
+- App registrata in Azure AD con API Permission `Dynamics CRM → user_impersonation`
+- In *Power Platform Admin Center → Environment → Settings → Users*: aggiungere
+  l'app come **Application User** con Security Role di lettura sulle entità
 
-### 3. Trovare l'URL dell'organizzazione CRM
+### 3. Prerequisito Dataverse: "Link to Microsoft Fabric"
 
-L'URL ha il formato: `https://<orgname>.crm<N>.dynamics.com`
+Lo shortcut Dataverse richiede che l'environment Dataverse abbia abilitato il
+feature **Link to Microsoft Fabric** (Power Apps Maker → Tables → Link to
+Microsoft Fabric). Questo espone le tabelle Dataverse come Delta in OneLake,
+rendendole indirizzabili come shortcut.
 
-Per trovarlo:
-- **Power Platform Admin Center** → Environments → seleziona ambiente → copia l'URL
-- Oppure: Dynamics 365 → Settings → Customizations → Developer Resources → Web API URL
+> Operazione *una tantum* da fare manualmente lato Dataverse.
 
-**Nota:** il suffisso `crmN` dipende dalla region:
-- `crm.dynamics.com` = Nord America
-- `crm4.dynamics.com` = EMEA
-- `crm5.dynamics.com` = Asia Pacific
-- ecc.
+### 4. Trigger workflow
 
-### 4. Entity Set Names per CRM
-
-I nomi EntitySet in Dataverse sono tipicamente il **nome logico plurale** della tabella:
-
-| Tabella | EntitySet |
-|---------|-----------|
-| Account | `accounts` |
-| Contact | `contacts` |
-| Opportunity | `opportunities` |
-| Lead | `leads` |
-| Case/Incident | `incidents` |
-| Quote | `quotes` |
-| Order | `salesorders` |
-| Invoice | `invoices` |
-| Custom: `new_myentity` | `new_myentities` |
-
-Per verificare: `GET https://<orgurl>/api/data/v9.2/` elenca tutti gli EntitySet disponibili.
+`Actions → Fabric Deploy → Run workflow` con i parametri:
+- `targetEnvironment`: `dev` | `prod`
+- `connectors`: `BC` | `CRM` | `BC,CRM`
+- `forceRecreate`: ricreazione pipeline (utile in caso di definition cache)
 
 ---
 
-## Esecuzione Pipeline DevOps
+## Differenze BC vs CRM
 
-```
-# Solo BC
-az pipelines run --name "fabric-deploy" --parameters connectors=BC targetEnvironment=prod
-
-# Solo CRM
-az pipelines run --name "fabric-deploy" --parameters connectors=CRM targetEnvironment=prod
-
-# Entrambi
-az pipelines run --name "fabric-deploy" --parameters connectors=BC,CRM targetEnvironment=prod
-```
-
-Oppure tramite UI DevOps selezionando i parametri.
-
----
-
-## Differenze chiave BC vs CRM
-
-| Aspetto | BC | CRM / Dataverse |
+| Aspetto | BC | CRM (Dataverse) |
 |---------|----|----|
-| **API** | ODataV4 via BC API | Web API v9.2 (OData v4) |
-| **Auth scope** | `https://api.businesscentral.dynamics.com/.default` | `https://<orgurl>/.default` |
-| **URL base** | `https://api.businesscentral.dynamics.com/v2.0/{tenant}/{env}/ODataV4/Company('{co}')/{entity}` | `https://<orgurl>/api/data/v9.2/{entityset}` |
-| **Filtro incrementale** | `SystemModifiedAt gt datetime'...'` | `modifiedon gt ...` |
-| **Paginazione** | `@odata.nextLink` | `@odata.nextLink` (max 5000/page) |
-| **Rate limiting** | Standard HTTP retry | 429 con `Retry-After` header |
-| **Chiave primaria** | Tipicamente `id` | Tipicamente `<entity>id` (es: `accountid`) |
-| **Multi-company** | Sì (loop su companies) | No (1 org = 1 ambiente) |
+| **Tecnica** | Spark Job + Open Mirroring (CSV) | Shortcut OneLake (Delta live) |
+| **Latenza dati** | Polling pianificato | Quasi real-time (managed link) |
+| **Item creati** | Mirroring DB, Spark Job, Pipeline | Connection + Shortcut |
+| **Codice Python** | `bc_sync.py` | nessuno |
+| **Aggiunta entità** | Aggiorna `BC_ENTITIES` + run | Aggiorna `CRM_ENTITIES` + run |
+
+---
+
+## Esecuzione locale (debug)
+
+```powershell
+.\scripts\deploy.ps1 `
+  -TenantId       "<tenant>" `
+  -ClientId       "<client>" `
+  -ClientSecret   "<secret>" `
+  -WorkspaceId    "<workspaceId>" `
+  -Connectors     "CRM" `
+  -CrmTenantId    "<tenant>" `
+  -CrmClientId    "<client>" `
+  -CrmClientSecret "<secret>" `
+  -CrmOrgUrl      "https://contoso.crm4.dynamics.com" `
+  -CrmEnvironmentDomain "https://contoso.crm4.dynamics.com" `
+  -CrmEntities    "msdynmkt_email,msdynmkt_journey,contact"
+```
