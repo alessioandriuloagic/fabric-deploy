@@ -26,6 +26,12 @@
 #                                       dallo shortcut Dataverse)
 #   CRM_ENTITIES               (var)   es: account,contact,opportunity
 #                                       (nomi tabella logici Dataverse)
+#   CRM_CONNECTION_ID          (var,    opzionale) ID di una Fabric Connection
+#                                       Dataverse gia' esistente (creata a mano).
+#                                       Se valorizzato lo shortcut la riusa e NON
+#                                       servono CRM_TENANT_ID/CLIENT_ID/SECRET.
+#                                       Il Service Principal di deploy deve avere
+#                                       ruolo "User" sulla connessione.
 #   CRM_TENANT_ID              (secret, opzionale - default = FABRIC_TENANT_ID)
 #   CRM_CLIENT_ID              (secret, opzionale - default = FABRIC_CLIENT_ID)
 #   CRM_CLIENT_SECRET          (secret, opzionale - default = FABRIC_CLIENT_SECRET)
@@ -83,6 +89,7 @@ jobs:
       CRM_CLIENT_ID:           ${{ secrets.CRM_CLIENT_ID }}
       CRM_CLIENT_SECRET:       ${{ secrets.CRM_CLIENT_SECRET }}
       CRM_CONNECTION_NAME:     ${{ vars.CRM_CONNECTION_NAME }}
+      CRM_CONNECTION_ID:       ${{ vars.CRM_CONNECTION_ID }}
 
     steps:
       - name: Checkout
@@ -156,6 +163,7 @@ jobs:
             CrmEnvironmentDomain = $env:CRM_ENVIRONMENT_DOMAIN
             CrmEntities          = $env:CRM_ENTITIES
             CrmConnectionName    = $env:CRM_CONNECTION_NAME
+            CrmConnectionId      = $env:CRM_CONNECTION_ID
           }
           if ($force) { $params["ForceRecreate"] = $true }
           & "${{ github.workspace }}\scripts\deploy.ps1" @params

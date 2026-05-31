@@ -41,7 +41,6 @@ param(
     # CRM / Dataverse
     [string]$CrmOrgUrl,
     [string]$CrmEnvironmentDomain,
-    [string]$CrmEntities,
     [string]$CrmTenantId,
     [string]$CrmClientId,
     [string]$CrmClientSecret,
@@ -136,7 +135,7 @@ if ($connList -contains "CRM") {
     Write-Host "  -- CRM / Dataverse --" -ForegroundColor DarkGray
     $CrmOrgUrl           = Read-IfEmpty $CrmOrgUrl           "CRM_ORG_URL (es. https://org.crm4.dynamics.com)"
     if (-not $CrmEnvironmentDomain) { $CrmEnvironmentDomain = $CrmOrgUrl }
-    $CrmEntities         = Read-IfEmpty $CrmEntities         "CRM_ENTITIES (es. account,contact,opportunity)"
+    $CrmEntities         = "msdynmkt_email,msdynmkt_journey,contact"  # entita' fisse
     # Opzionali: se vuoti, deploy.ps1 usa le credenziali Fabric
     $CrmTenantId         = Read-IfEmpty $CrmTenantId         "CRM_TENANT_ID (invio = usa Fabric)"
     $CrmClientId         = Read-IfEmpty $CrmClientId         "CRM_CLIENT_ID (invio = usa Fabric)"
