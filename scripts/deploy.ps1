@@ -529,9 +529,9 @@ function New-DataverseShortcut {
             type = "Dataverse"
             dataverse = @{
                 connectionId      = $ConnectionId
-                environmentDomain = $EnvironmentDomain
+                # environmentDomain vuole solo il hostname, senza schema https://
+                environmentDomain = ($EnvironmentDomain -replace '^https?://', '' -replace '/$', '')
                 tableName         = $TableName
-                deltaLakeFolder   = $TableName
             }
         }
     } | ConvertTo-Json -Depth 10
