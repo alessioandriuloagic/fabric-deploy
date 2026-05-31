@@ -29,6 +29,10 @@ param(
     [string]$CrmApiVersion  = "v9.2",
     [string]$CrmEntities    = 'msdynmkt_email,msdynmkt_journey,contact',
     [string]$CrmConnectionName = "",
+    # ID di una Fabric Connection Dataverse gia' esistente (creata a mano).
+    # Se valorizzato, lo shortcut la riusa direttamente e NON serve il
+    # Service Principal Dataverse (CrmTenantId/CrmClientId/CrmClientSecret).
+    [string]$CrmConnectionId = "",
 
     [string]$LakehouseName      = "LH_Bronze",
     [string]$BcMirroringDbName  = "MirrorDB_BC",
@@ -91,17 +95,25 @@ foreach ($conn in $connectorList) {
         }
         "CRM" {
             Assert-NotUnresolved "CrmOrgUrl"      $CrmOrgUrl
-            Assert-NotUnresolved "CrmTenantId"    $CrmTenantId
-            Assert-NotUnresolved "CrmClientId"    $CrmClientId
-            Assert-NotUnresolved "CrmClientSecret" $CrmClientSecret
             Assert-NotUnresolved "CrmEntities"    $CrmEntities
 
             if ([string]::IsNullOrEmpty($CrmOrgUrl)) { Write-Host "##[error] CrmOrgUrl mancante."; exit 1 }
 
-            # Default: usa credenziali Fabric se non specificate per CRM
-            if ([string]::IsNullOrEmpty($CrmTenantId) -or $CrmTenantId -eq "")    { $CrmTenantId    = $TenantId }
-            if ([string]::IsNullOrEmpty($CrmClientId) -or $CrmClientId -eq "")    { $CrmClientId    = $ClientId }
-            if ([string]::IsNullOrEmpty($CrmClientSecret) -or $CrmClientSecret -eq ""){ $CrmClientSecret = $ClientSecret }
+            $useExistingCrmConnection = -not ([string]::IsNullOrWhiteSpace($CrmConnectionId))
+            if ($useExistingCrmConnection) {
+                Assert-NotUnresolved "CrmConnectionId" $CrmConnectionId
+                Write-Host "  [INFO] CrmConnectionId fornito -> riuso connessione esistente, Service Principal Dataverse non richiesto."
+            } else {
+                # Service Principal Dataverse richiesto solo se la connessione va creata
+                Assert-NotUnresolved "CrmTenantId"    $CrmTenantId
+                Assert-NotUnresolved "CrmClientId"    $CrmClientId
+                Assert-NotUnresolved "CrmClientSecret" $CrmClientSecret
+
+                # Default: usa credenziali Fabric se non specificate per CRM
+                if ([string]::IsNullOrEmpty($CrmTenantId) -or $CrmTenantId -eq "")    { $CrmTenantId    = $TenantId }
+                if ([string]::IsNullOrEmpty($CrmClientId) -or $CrmClientId -eq "")    { $CrmClientId    = $ClientId }
+                if ([string]::IsNullOrEmpty($CrmClientSecret) -or $CrmClientSecret -eq ""){ $CrmClientSecret = $ClientSecret }
+            }
 
             # Default environment domain = CrmOrgUrl
             if ([string]::IsNullOrEmpty($CrmEnvironmentDomain) -or $CrmEnvironmentDomain -eq "") {
@@ -132,12 +144,22 @@ function Invoke-FabricApi {
         $response = Invoke-WebRequest @params -UseBasicParsing
     } catch {
         $ex = $_.Exception
-        if ($ex.Response -ne $null) {
-            $stream = $ex.Response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $reader.BaseStream.Position = 0
-            Write-Host "##[error] API Response Body: $($reader.ReadToEnd())"
-        } else { Write-Host "##[error] API Error: $($ex.Message)" }
+        # ErrorDetails.Message e' disponibile in PS7 e contiene gia' il body come stringa
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            Write-Host "##[error] API Response Body: $($_.ErrorDetails.Message)"
+        } elseif ($ex.Response -ne $null) {
+            # Fallback PS5.1: legge lo stream dalla WebException
+            try {
+                $stream = $ex.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $reader.BaseStream.Position = 0
+                Write-Host "##[error] API Response Body: $($reader.ReadToEnd())"
+            } catch {
+                Write-Host "##[error] API Error: $($ex.Message)"
+            }
+        } else {
+            Write-Host "##[error] API Error: $($ex.Message)"
+        }
         throw
     }
     if ($response.StatusCode -eq 202) {
@@ -643,13 +665,20 @@ if ($connectorList -contains "CRM") {
 
     Write-Host ""
     Write-Host "=== CRM STEP 2: Connection Dataverse ==="
-    $crmConnectionId = Get-OrCreate-DataverseConnection `
-        -DisplayName $CrmConnectionName `
-        -EnvironmentDomain $CrmEnvironmentDomain `
-        -DvTenantId $CrmTenantId `
-        -DvClientId $CrmClientId `
-        -DvClientSecret $CrmClientSecret `
-        -Headers $headers
+    if (-not [string]::IsNullOrWhiteSpace($CrmConnectionId)) {
+        # Connessione gia' esistente (creata a mano in Fabric): la riuso direttamente.
+        # Il Service Principal deve avere almeno ruolo "User" su questa connessione.
+        $crmConnectionId = $CrmConnectionId
+        Write-Host "  [OK] Riuso Connection Dataverse esistente - ID: $crmConnectionId"
+    } else {
+        $crmConnectionId = Get-OrCreate-DataverseConnection `
+            -DisplayName $CrmConnectionName `
+            -EnvironmentDomain $CrmEnvironmentDomain `
+            -DvTenantId $CrmTenantId `
+            -DvClientId $CrmClientId `
+            -DvClientSecret $CrmClientSecret `
+            -Headers $headers
+    }
     if ([string]::IsNullOrWhiteSpace($crmConnectionId)) {
         Write-Host "##[error] Impossibile creare/recuperare Connection Dataverse"; exit 1
     }
