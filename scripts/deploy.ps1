@@ -532,6 +532,7 @@ function New-DataverseShortcut {
                 # environmentDomain vuole solo il hostname, senza schema https://
                 environmentDomain = ($EnvironmentDomain -replace '^https?://', '' -replace '/$', '')
                 tableName         = $TableName
+                deltaLakeFolder   = ""
             }
         }
     } | ConvertTo-Json -Depth 10
